@@ -57,6 +57,13 @@ pub fn encode_symbols(symbols: &[(u64, &str)]) -> Vec<u8> {
 
 const MAX_FRAME_LEN: u32 = 8 * 1024 * 1024; // 8 MiB
 
+// Per-type maximum payload sizes, used to reject implausible length prefixes
+// during resync without waiting for the full body to arrive.
+//   Handshake (0x00): 1 tag + 8 pid + 2 name_len + 65535 name  = 65546
+//   Events    (0x01): 1 tag + 2 count + 65535 * AllocEvent::SIZE (≈6.6 MiB, but capped by MAX_FRAME_LEN)
+//   Symbols   (0x02): 1 tag + 2 count + 65535 * (8+2+65535) (> MAX_FRAME_LEN — no extra cap needed)
+const MAX_HANDSHAKE_LEN: u32 = 1 + 8 + 2 + 65535; // 65546
+
 enum DecoderState {
     NeedLength,
     NeedBody { total: usize },
@@ -83,16 +90,41 @@ impl FrameDecoder {
         loop {
             match self.state {
                 DecoderState::NeedLength => {
-                    if self.buf.len() < 4 {
-                        return None; // incomplete — not an error
+                    if self.buf.len() < 5 {
+                        if self.buf.len() < 4 {
+                            return None;
+                        }
+                        let length = u32::from_le_bytes(self.buf[0..4].try_into().unwrap());
+                        if length == 0 || length > MAX_FRAME_LEN {
+                            self.buf.drain(0..1);
+                            continue;
+                        }
+                        return None; // valid-looking length, no type byte yet
                     }
+
                     let length = u32::from_le_bytes(self.buf[0..4].try_into().unwrap());
-                    if length == 0 || length > MAX_FRAME_LEN {
-                        // Untrustworthy length prefix — resync one byte at a time
+                    let ftype  = self.buf[4];
+
+                    if !Self::is_plausible_header(length, ftype) {
                         self.buf.drain(0..1);
                         continue;
                     }
-                    self.state = DecoderState::NeedBody { total: 4 + length as usize };
+
+                    // For Handshake frames, the length is uniquely determined by the
+                    // name_len field (length = 11 + name_len).  If we have enough
+                    // bytes buffered to read name_len (15 bytes total: 4+1+8+2), cross-
+                    // check it to reject accidental matches in junk data.
+                    if ftype == 0x00 && self.buf.len() >= 15 {
+                        let name_len =
+                            u16::from_le_bytes(self.buf[13..15].try_into().unwrap()) as u32;
+                        if length != 11 + name_len {
+                            self.buf.drain(0..1);
+                            continue;
+                        }
+                    }
+
+                    let total = 4 + length as usize;
+                    self.state = DecoderState::NeedBody { total };
                 }
                 DecoderState::NeedBody { total } => {
                     if self.buf.len() < total {
@@ -101,18 +133,47 @@ impl FrameDecoder {
                     let frame_bytes: Vec<u8> = self.buf.drain(0..total).collect();
                     self.state = DecoderState::NeedLength;
 
-                    if frame_bytes.len() < 5 {
-                        continue;
-                    }
-                    let ftype = frame_bytes[4];
+                    let ftype   = frame_bytes[4];
                     let payload = &frame_bytes[5..];
 
                     match Self::decode_payload(ftype, payload) {
                         Some(frame) => return Some(frame),
-                        None => continue,
+                        None => {
+                            // Payload failed to decode despite valid-looking header —
+                            // resync from byte 1 of what we thought was the frame start.
+                            let mut prepend = frame_bytes[1..].to_vec();
+                            prepend.extend_from_slice(&self.buf);
+                            self.buf = prepend;
+                            continue;
+                        }
                     }
                 }
             }
+        }
+    }
+
+    /// Returns true if (length, ftype) looks like a real frame header.
+    fn is_plausible_header(length: u32, ftype: u8) -> bool {
+        if length == 0 || length > MAX_FRAME_LEN {
+            return false;
+        }
+        match ftype {
+            // Handshake: length = 1(tag) + 8(pid) + 2(name_len) + name_len
+            // Minimum length with no payload tag (the tag is counted differently)...
+            // Actually wire layout: length field does NOT include itself (4 bytes).
+            // The 4-byte length field covers the entire rest: type byte + payload.
+            // Handshake payload after type byte: pid(8) + name_len_field(2) + name
+            // So length = 1 + 8 + 2 + name_len = 11 + name_len, range [11, 65546].
+            0x00 => length >= 11 && length <= MAX_HANDSHAKE_LEN,
+            // Events: length = 1(type) + 2(count) + count * SIZE = 3 + count * SIZE
+            // Valid lengths: 3, 3+SIZE, 3+2*SIZE, ...
+            0x01 => {
+                length >= 3
+                    && (length - 3) % (AllocEvent::SIZE as u32) == 0
+            }
+            // Symbols: length = 1 + 2 + variable, minimum 3 bytes
+            0x02 => length >= 3,
+            _ => false,
         }
     }
 
