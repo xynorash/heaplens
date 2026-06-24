@@ -86,7 +86,7 @@ impl FrameDecoder {
     /// Returns the next complete Frame, or None if more bytes are needed.
     /// Malformed frames are skipped silently (skip-and-continue).
     /// Incomplete frames (not enough bytes yet) return None without draining.
-    pub fn next(&mut self) -> Option<Frame> {
+    fn poll(&mut self) -> Option<Frame> {
         loop {
             match self.state {
                 DecoderState::NeedLength => {
@@ -164,12 +164,12 @@ impl FrameDecoder {
             // The 4-byte length field covers the entire rest: type byte + payload.
             // Handshake payload after type byte: pid(8) + name_len_field(2) + name
             // So length = 1 + 8 + 2 + name_len = 11 + name_len, range [11, 65546].
-            0x00 => length >= 11 && length <= MAX_HANDSHAKE_LEN,
+            0x00 => (11..=MAX_HANDSHAKE_LEN).contains(&length),
             // Events: length = 1(type) + 2(count) + count * SIZE = 3 + count * SIZE
             // Valid lengths: 3, 3+SIZE, 3+2*SIZE, ...
             0x01 => {
                 length >= 3
-                    && (length - 3) % (AllocEvent::SIZE as u32) == 0
+                    && (length - 3).is_multiple_of(AllocEvent::SIZE as u32)
             }
             // Symbols: length = 1 + 2 + variable, minimum 3 bytes
             0x02 => length >= 3,
@@ -246,4 +246,12 @@ impl FrameDecoder {
 
 impl Default for FrameDecoder {
     fn default() -> Self { Self::new() }
+}
+
+impl Iterator for FrameDecoder {
+    type Item = Frame;
+
+    fn next(&mut self) -> Option<Frame> {
+        self.poll()
+    }
 }
