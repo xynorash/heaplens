@@ -99,7 +99,7 @@ mod tests {
         stack[2] = 0x0000_7fff_1234_5678;
 
         let original = AllocEvent::new(
-            EventKind::Alloc,
+            EventKind::Realloc,
             0x0000_2000_0000_0010,
             0x0000_1fff_ffff_fff0,
             0x0000_0000_0001_0000,
