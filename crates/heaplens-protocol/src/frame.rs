@@ -49,7 +49,7 @@ pub fn encode_symbols(symbols: &[(u64, &str)]) -> Vec<u8> {
     for (addr, name) in symbols {
         let name_bytes = name.as_bytes();
         buf.extend_from_slice(&addr.to_le_bytes());
-        buf.extend_from_slice(&(name_bytes.len() as u16).to_le_bytes());
+        buf.extend_from_slice(&u16::try_from(name_bytes.len()).expect("symbol name exceeds 65535 bytes").to_le_bytes());
         buf.extend_from_slice(name_bytes);
     }
     buf
