@@ -12,7 +12,7 @@ pub enum NodeState {
 
 /// Single node in the ownership graph.
 /// Field names are the wire contract — Flutter mirrors them verbatim.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 pub struct NodeDto {
     pub id:     u64,
     pub ptr:    u64,
@@ -37,7 +37,7 @@ pub struct NodeDto {
 ///
 /// Lenient deserialization (no `deny_unknown_fields`) is deliberate: forward-
 /// compatible additions to NodeDto must not break older deserializers.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum GraphMessage {
     Snapshot { ts: u64, nodes: Vec<NodeDto> },
