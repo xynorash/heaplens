@@ -1,0 +1,15 @@
+[package]
+name = "heaplens-daemon"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "heaplens-daemon"
+path = "src/main.rs"
+
+[dependencies]
+heaplens-protocol = { path = "../heaplens-protocol" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time"] }
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }

@@ -3,5 +3,6 @@ resolver = "2"
 members = [
     "crates/heaplens-protocol",
     "crates/heaplens-alloc",
-    # TODO: crates/heaplens-daemon
+    "crates/heaplens-daemon",
+    # TODO: heaplens-flutter (Stage 4)
 ]
