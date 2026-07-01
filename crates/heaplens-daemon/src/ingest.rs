@@ -15,10 +15,12 @@ pub async fn run(pipe_name: String, tx: mpsc::UnboundedSender<GraphMsg>) {
             let mut opts = ServerOptions::new();
             if first {
                 opts.first_pipe_instance(true);
-                first = false;
             }
             match opts.create(&pipe_name) {
-                Ok(s) => s,
+                Ok(s) => {
+                    first = false;
+                    s
+                }
                 Err(e) => {
                     warn!("pipe create failed: {e}");
                     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -51,8 +53,8 @@ pub async fn run(pipe_name: String, tx: mpsc::UnboundedSender<GraphMsg>) {
                                 let _ = tx.send(GraphMsg::Events(events));
                             }
                             Frame::Symbols(_) | Frame::Handshake { .. } => {
-                                // Symbols are resolved client-side and sent as addresses;
-                                // the daemon resolves via Resolver. Handshake is informational.
+                                // Client-supplied symbol names are ignored; the daemon resolves
+                                // addresses via its own Resolver. Handshake is informational.
                             }
                         }
                     }
