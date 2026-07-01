@@ -1250,3 +1250,77 @@ git commit -m "fix(daemon): clippy clean — -D warnings"
 - [ ] Running `heaplens-daemon` and then `alloc_smoke` (from Stage 2) produces logged diff lines showing nodes appearing; dealloc of owner produces orphan-candidate log lines
 - [ ] No anomaly detection, WebSocket, or SQLite code present
 - [ ] `heaplens-daemon` does not depend on `heaplens-alloc`
+
+---
+
+## Post-Implementation Notes (2026-07-02)
+
+These entries are preserved here because they represent non-obvious constraints and correctness decisions that M4 authors must know before touching the graph or the drain loop.
+
+### Bug 1 — `drain_diff`: add / update / remove must be mutually exclusive
+
+**What was wrong.** The initial implementation filtered `updated` only against `added`, not against `removed`. When a parent node's `edges_out` was cleaned up during `on_dealloc` (inserting it into `updated`) and the parent itself was also deallocated in the same tick (inserting it into `removed`), the node appeared in both `update` and `remove` in the same `Diff` message — a protocol violation. A second case also existed: a node allocated and freed in the same tick would appear in both `add` and `remove`.
+
+**Fix.** Three filters now enforce strict disjointness:
+- `add` = nodes in `added` that are NOT in `removed_set`
+- `update` = nodes in `updated` that are NOT in `added_set` AND NOT in `removed_set`
+- `remove` = ids in `removed` that are NOT in `added_set` (nodes the consumer never saw)
+
+Nodes born and freed within one drain window are invisible to the consumer — they appear in neither add nor remove. This is correct: the consumer has no record of them.
+
+**Tests.** `dealloc_orphans_children` asserts `update_ids ∩ remove_ids = ∅`. `cascaded_dealloc_same_tick_disjoint` covers the born-and-freed case: both child and parent deallocated before any drain, asserts all three sets are pairwise disjoint.
+
+### Bug 2 — `had_owner_once` set by `on_dealloc` was untested
+
+**What was wrong.** The field exists and is set correctly, but no test verified it. `had_owner_once` is the sole signal M4 orphan detection reads; an untested invariant on the one field the next stage depends on is a future regression trap.
+
+**Fix.** Added `pub fn node_by_ptr(&self, ptr: u64) -> Option<&Node>` to `OwnershipGraph` (not `#[cfg(test)]` — integration tests cannot see cfg-test items in the lib). Strengthened `dealloc_orphans_children` to assert directly:
+```rust
+let child_node = g.node_by_ptr(0x2000).expect("child still live");
+assert!(child_node.had_owner_once);
+assert!(child_node.owner.is_none());
+```
+
+### Bug 3 — `ingest.rs`: `first_pipe_instance` guard cleared before create succeeds
+
+**What was wrong.** The `first` flag was set to `false` before `opts.create()` returned. If the first create failed (e.g. another daemon instance holding the pipe with `FILE_FLAG_FIRST_PIPE_INSTANCE`), every subsequent retry called bare `ServerOptions::new()` without `first_pipe_instance(true)`. If the competing daemon later exited, this daemon would open the pipe without the exclusivity guarantee.
+
+**Fix.** Moved `first = false` into the `Ok(s)` arm so it only clears on successful creation.
+
+**Coverage.** No automated test — requires OS-level pipe contention. Verified by inspection. This is a known-uncovered path; any refactor of the `ingest::run` create loop must preserve the `first = false` placement.
+
+---
+
+### Drain cadence is semantically load-bearing
+
+The Bug 1 fix means **drain timing changes observable behaviour**. Specifically:
+
+> Nodes allocated and freed within the same drain window are correctly suppressed — they appear in neither `add` nor `remove`. This is intentional. A Flutter consumer that never received a node in `add` must never receive its id in `remove`.
+
+**Consequence for tests and M4 code:**
+
+Any consumer or test that accumulates a full workload (allocs + deallocs) and then calls `drain_diff` once will see fewer nodes than expected — because nodes whose full lifecycle happened within that single window are invisible. The cross-process wire test confirmed this: calling `drain_diff` once after all events yielded zero nodes. The fix was to call `drain_diff` after each `Events` batch, mimicking the daemon's per-tick drain.
+
+**Rule:** drain per tick, not on shutdown. The daemon's main loop already does this correctly (Tick → drain_diff). Any M4 test that follows "accumulate all events, drain once, assert" must be rewritten to drain per batch or per tick.
+
+---
+
+### Cross-process wire test — M3 integration proof
+
+**Files:**
+- Producer: `crates/heaplens-alloc/examples/wire_producer.rs`
+- Test: `crates/heaplens-daemon/tests/cross_process_wire.rs` (gated `#![cfg(windows)]`)
+- Commit: `2acccba`
+
+**What it proves.** Two real OS processes communicate over `\\.\pipe\heaplens`. The producer uses `HeapLensAlloc` as `#[global_allocator]` with `#[inline(never)]` nested calls to generate non-trivial stacks. The daemon's `ingest::run` server runs in the test process; the producer runs as a child `std::process::Command`.
+
+**Results (first run, no flakiness):**
+- `alloc_count: 202` — observed ≥ 202 nodes (minimum threshold: 100)
+- `nodes_with_edges: 200` — φ inference fired on 200 of 202 nodes using real captured stacks
+- FrameDecoder resyncs: **0** — all frames decoded cleanly; the Stage 2 encoder and Stage 1 decoder agree byte-for-byte
+
+**To run manually:**
+```
+cargo build --example wire_producer -p heaplens-alloc
+cargo test -p heaplens-daemon --test cross_process_wire -- --nocapture
+```
