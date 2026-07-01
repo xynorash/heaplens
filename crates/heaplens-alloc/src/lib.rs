@@ -86,17 +86,23 @@ fn record(kind: EventKind, ptr: u64, old_ptr: u64, size: u64, align: u32) {
 unsafe impl GlobalAlloc for HeapLensAlloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         let ptr = System.alloc(layout);
+        if ptr.is_null() {
+            return ptr;
+        }
         record(EventKind::Alloc, ptr as u64, 0, layout.size() as u64, layout.align() as u32);
         ptr
     }
 
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        System.dealloc(ptr, layout);
         record(EventKind::Dealloc, ptr as u64, 0, layout.size() as u64, layout.align() as u32);
+        System.dealloc(ptr, layout);
     }
 
     unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
         let new_ptr = System.realloc(ptr, layout, new_size);
+        if new_ptr.is_null() {
+            return new_ptr;
+        }
         record(
             EventKind::Realloc,
             new_ptr as u64,
