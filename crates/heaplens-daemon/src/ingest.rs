@@ -47,7 +47,7 @@ pub async fn run(pipe_name: String, tx: mpsc::UnboundedSender<GraphMsg>) {
                 }
                 Ok(n) => {
                     decoder.push(&buf[..n]);
-                    while let Some(frame) = decoder.next() {
+                    for frame in decoder.by_ref() {
                         match frame {
                             Frame::Events(events) => {
                                 let _ = tx.send(GraphMsg::Events(events));

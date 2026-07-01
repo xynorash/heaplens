@@ -34,6 +34,12 @@ pub struct OwnershipGraph {
     last_ts: u64,
 }
 
+impl Default for OwnershipGraph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl OwnershipGraph {
     pub fn new() -> Self {
         OwnershipGraph {

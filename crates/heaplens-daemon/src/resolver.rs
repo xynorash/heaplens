@@ -4,6 +4,12 @@ pub struct Resolver {
     map: HashMap<u64, String>,
 }
 
+impl Default for Resolver {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Resolver {
     pub fn new() -> Self {
         Resolver { map: HashMap::new() }
