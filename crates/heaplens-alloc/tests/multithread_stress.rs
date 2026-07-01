@@ -26,5 +26,9 @@ fn concurrent_allocs_no_deadlock() {
     for h in handles {
         h.join().expect("thread must not panic");
     }
-    // If we reach here without deadlock or abort, the test passes.
+
+    // Drain all recorded events and assert that at least one was captured.
+    let mut count = 0usize;
+    heaplens_alloc::ring::drain_all(|_ev| { count += 1; });
+    assert!(count > 0, "expected at least one recorded event, got 0");
 }
