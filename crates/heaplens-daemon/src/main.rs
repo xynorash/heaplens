@@ -1,8 +1,8 @@
-mod config;
-mod graph;
-mod ingest;
-mod msg;
-mod resolver;
+pub mod config;
+pub mod graph;
+pub mod ingest;
+pub mod msg;
+pub mod resolver;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
