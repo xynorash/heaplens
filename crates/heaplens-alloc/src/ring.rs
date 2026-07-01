@@ -22,6 +22,12 @@ pub struct Ring {
 unsafe impl Send for Ring {}
 unsafe impl Sync for Ring {}
 
+impl Default for Ring {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Ring {
     pub fn new() -> Self {
         let layout = Layout::array::<AllocEvent>(CAP).expect("ring layout");

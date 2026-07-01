@@ -30,6 +30,12 @@ impl HeapLensAlloc {
     pub const fn new() -> Self { HeapLensAlloc }
 }
 
+impl Default for HeapLensAlloc {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 static WRITER_ONCE: Once = Once::new();
 
 /// Spawn the writer thread exactly once. Safe to call from the hot path:
