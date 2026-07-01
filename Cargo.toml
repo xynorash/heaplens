@@ -2,6 +2,6 @@
 resolver = "2"
 members = [
     "crates/heaplens-protocol",
-    # TODO: crates/heaplens-alloc
+    "crates/heaplens-alloc",
     # TODO: crates/heaplens-daemon
 ]
