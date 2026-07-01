@@ -148,22 +148,27 @@ impl OwnershipGraph {
     pub fn drain_diff(&mut self, resolver: &Resolver) -> GraphMessage {
         let ts = self.last_ts;
 
-        let add: Vec<NodeDto> = self
-            .added
-            .iter()
+        let added_set: HashSet<u64> = self.added.iter().copied().collect();
+        let removed_set: HashSet<u64> = self.removed.iter().copied().collect();
+
+        // Nodes born and freed within the same tick are invisible to the consumer.
+        let add: Vec<NodeDto> = self.added.iter()
+            .filter(|&&id| !removed_set.contains(&id))
             .filter_map(|&id| self.nodes.get(&id))
             .map(|n| Self::node_to_dto(n, resolver))
             .collect();
 
-        let update: Vec<NodeDto> = self
-            .updated
-            .iter()
-            .filter(|&&id| !self.added.contains(&id)) // skip nodes already in add
+        let update: Vec<NodeDto> = self.updated.iter()
+            .filter(|&&id| !added_set.contains(&id) && !removed_set.contains(&id))
             .filter_map(|&id| self.nodes.get(&id))
             .map(|n| Self::node_to_dto(n, resolver))
             .collect();
 
-        let remove: Vec<u64> = self.removed.clone();
+        // Only remove nodes the consumer has previously seen (not born this tick).
+        let remove: Vec<u64> = self.removed.iter()
+            .filter(|&&id| !added_set.contains(&id))
+            .copied()
+            .collect();
 
         self.added.clear();
         self.updated.clear();
@@ -187,6 +192,10 @@ impl OwnershipGraph {
             .filter(|n| n.live && n.stack_len > 0 && search_set.contains(&n.stack[0]))
             .max_by_key(|n| (n.ts, n.id))
             .map(|n| n.id)
+    }
+
+    pub fn node_by_ptr(&self, ptr: u64) -> Option<&Node> {
+        self.by_ptr.get(&ptr).and_then(|&id| self.nodes.get(&id))
     }
 
     fn node_to_dto(n: &Node, resolver: &Resolver) -> NodeDto {

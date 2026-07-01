@@ -87,24 +87,54 @@ fn dealloc_orphans_children() {
     let c_ev = make_ev(EventKind::Alloc, 0x2000, 0, 32, 200, &[0xBBBB, 0xAAAA]);
     g.on_alloc(&c_ev);
 
-    // Drain the initial adds
     let r = Resolver::new();
     let _ = g.drain_diff(&r);
 
-    // Dealloc owner
     g.on_dealloc(0x1000);
 
     let diff = g.drain_diff(&r);
     let (_, updated, removed) = unwrap_diff(diff);
 
-    // Owner is in remove
-    // Child is in update (owner set to None)
     assert!(!removed.is_empty(), "owner should be in removed");
     assert!(!updated.is_empty(), "child should be in updated");
 
-    // Verify the child node's had_owner_once — must inspect internal state
-    // We do this indirectly: after a second dealloc of the child, the child was live
-    // so this test is complete if the update set is non-empty and removed is non-empty
+    // Verify no id appears in both update and remove
+    let update_ids: std::collections::HashSet<u64> = updated.iter().map(|n| n.id).collect();
+    for &rid in &removed {
+        assert!(!update_ids.contains(&rid), "id {rid} must not be in both update and remove");
+    }
+
+    // Verify had_owner_once on the still-live child
+    let child_node = g.node_by_ptr(0x2000).expect("child still live");
+    assert!(child_node.had_owner_once, "child.had_owner_once must be true after owner freed");
+    assert!(child_node.owner.is_none(), "child.owner must be None after owner freed");
+}
+
+// cascaded dealloc within same tick: remove ∩ update must be disjoint
+#[test]
+fn cascaded_dealloc_same_tick_disjoint() {
+    let mut g = OwnershipGraph::new();
+
+    let o_ev = make_ev(EventKind::Alloc, 0x1000, 0, 64, 100, &[0xAAAA]);
+    g.on_alloc(&o_ev);
+    let c_ev = make_ev(EventKind::Alloc, 0x2000, 0, 32, 200, &[0xBBBB, 0xAAAA]);
+    g.on_alloc(&c_ev);
+
+    // No drain between the two deallocs — both within the same tick
+    g.on_dealloc(0x2000); // child first
+    g.on_dealloc(0x1000); // then owner
+
+    let r = Resolver::new();
+    let diff = g.drain_diff(&r);
+    let (add, update, remove) = unwrap_diff(diff);
+
+    let remove_set: std::collections::HashSet<u64> = remove.iter().copied().collect();
+    for n in &add {
+        assert!(!remove_set.contains(&n.id), "add/remove overlap: id {}", n.id);
+    }
+    for n in &update {
+        assert!(!remove_set.contains(&n.id), "update/remove overlap: id {}", n.id);
+    }
 }
 
 // realloc: ptr migrates, size updates, same id retained
