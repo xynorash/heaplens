@@ -23,6 +23,8 @@ pub fn run() {
     let mut symbol_cache: HashMap<u64, String> = HashMap::new();
 
     loop {
+        symbol_cache.clear();
+
         // ── Connect ─────────────────────────────────────────────────────────
         let mut pipe = loop {
             match OpenOptions::new().read(true).write(true).open(PIPE_PATH) {
