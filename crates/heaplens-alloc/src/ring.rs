@@ -141,7 +141,13 @@ pub fn drain_all(mut f: impl FnMut(AllocEvent)) {
             f(ev);
         }
         if !reg[i].producer_alive.load(Ordering::Acquire) {
-            reg.swap_remove(i); // dead + empty: reclaim slot
+            // The Acquire on producer_alive synchronizes with the thread's death Release,
+            // which transitively happens-after the last push's tail Release.
+            // A second drain here picks up any event the first pass missed on weak-memory hardware.
+            while let Some(ev) = reg[i].pop() {
+                f(ev);
+            }
+            reg.swap_remove(i);
         } else {
             i += 1;
         }
