@@ -100,8 +100,8 @@ pub fn run() {
                 thread::sleep(POLL_SLEEP);
             }
         }
-        // Fell through 'send → reconnect. symbol_cache is preserved across
-        // reconnects so we don't re-emit already-sent symbol definitions.
+        // Fell through 'send → reconnect. symbol_cache is cleared at the top
+        // of the reconnect loop so all addresses are re-resolved and re-sent.
     }
 }
 
