@@ -1,5 +1,7 @@
-mod guard;
-mod ring;
+#[doc(hidden)]
+pub mod guard;
+#[doc(hidden)]
+pub mod ring;
 mod capture;
 mod writer;
 
