@@ -14,6 +14,10 @@ fn thread_ring_drainable_after_exit() {
 
     std::thread::sleep(std::time::Duration::from_millis(20));
 
+    // drain_all requires the recursion guard to be permanently set on the
+    // calling thread (writer-thread invariant §12.4).
+    heaplens_alloc::guard::force_enter_permanent();
+
     let mut found = false;
     ring::drain_all(|e| {
         if e.ptr == 0xBEEF_CAFE {

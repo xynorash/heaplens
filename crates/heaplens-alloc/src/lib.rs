@@ -7,6 +7,7 @@ mod writer;
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Once;
+use std::sync::atomic::{AtomicBool, Ordering};
 use heaplens_protocol::EventKind;
 use heaplens_protocol::AllocEvent;
 
@@ -37,6 +38,7 @@ impl Default for HeapLensAlloc {
 }
 
 static WRITER_ONCE: Once = Once::new();
+static WRITER_DEAD: AtomicBool = AtomicBool::new(false);
 
 /// Spawn the writer thread exactly once. Safe to call from the hot path:
 /// after the first successful call_once, subsequent calls are a single
@@ -47,12 +49,16 @@ static WRITER_ONCE: Once = Once::new();
 #[inline]
 fn ensure_writer() {
     WRITER_ONCE.call_once(|| {
-        // Errors here are unrecoverable but must not panic the host.
-        // If spawn fails (e.g., out of threads), events silently pile up
-        // in the ring until it fills, after which they are dropped.
-        let _ = std::thread::Builder::new()
+        if std::thread::Builder::new()
             .name("heaplens-writer".to_owned())
-            .spawn(writer::run);
+            .spawn(writer::run)
+            .is_err()
+        {
+            // Spawn failed (e.g., out of threads). Mark the writer dead so
+            // record() can skip the ring push rather than filling the ring
+            // silently until it overflows.
+            WRITER_DEAD.store(true, Ordering::Relaxed);
+        }
     });
 }
 
@@ -67,6 +73,9 @@ fn ensure_writer() {
 fn record(kind: EventKind, ptr: u64, old_ptr: u64, size: u64, align: u32) {
     // 1. Re-entrancy check — must be the very first thing.
     if guard::is_set() { return; }
+
+    // Early-exit if the writer thread failed to spawn; no consumer exists.
+    if WRITER_DEAD.load(Ordering::Relaxed) { return; }
 
     // 2. Acquire guard (panic-safe RAII).
     let _g = guard::ScopedGuard::enter();

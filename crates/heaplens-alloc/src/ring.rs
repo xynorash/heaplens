@@ -135,9 +135,16 @@ pub fn push(ev: AllocEvent) -> bool {
     THREAD_RING.with(|h| h.0.push(ev))
 }
 
-/// Drain all rings, calling `f` for each event. Removes dead rings that have
-/// been fully drained. Called only from the writer thread.
+/// Drain all events from all registered rings.
+///
+/// # Panics (debug builds)
+/// Panics if the calling thread has not called `guard::force_enter_permanent()`.
+/// This function must only be called from the writer thread.
 pub fn drain_all(mut f: impl FnMut(AllocEvent)) {
+    debug_assert!(
+        crate::guard::is_set(),
+        "drain_all must be called only from a thread where the recursion guard is permanently set (writer thread)"
+    );
     let mut reg = registry()
         .lock()
         .unwrap_or_else(|p| p.into_inner());
@@ -219,6 +226,9 @@ mod tests {
 
         // Give TLS destructor time to run and mark producer_alive = false.
         std::thread::sleep(std::time::Duration::from_millis(10));
+
+        // drain_all requires the recursion guard to be permanently set.
+        crate::guard::force_enter_permanent();
 
         let mut found = false;
         drain_all(|e| {

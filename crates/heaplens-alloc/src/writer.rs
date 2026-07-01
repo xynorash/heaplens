@@ -96,7 +96,7 @@ pub fn run() {
 
                 batch.clear();
                 last_flush = Instant::now();
-            } else if batch.is_empty() {
+            } else {
                 thread::sleep(POLL_SLEEP);
             }
         }

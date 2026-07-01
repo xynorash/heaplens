@@ -27,6 +27,10 @@ fn concurrent_allocs_no_deadlock() {
         h.join().expect("thread must not panic");
     }
 
+    // drain_all requires the recursion guard to be permanently set on the
+    // calling thread (writer-thread invariant §12.4).
+    heaplens_alloc::guard::force_enter_permanent();
+
     // Drain all recorded events and assert that at least one was captured.
     let mut count = 0usize;
     heaplens_alloc::ring::drain_all(|_ev| { count += 1; });

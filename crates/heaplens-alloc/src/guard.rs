@@ -27,6 +27,7 @@ impl ScopedGuard {
     /// is false — the guard does not check this itself.
     #[inline]
     pub fn enter() -> Self {
+        debug_assert!(!is_set(), "ScopedGuard::enter called on a permanently-guarded thread");
         IN_ALLOC.with(|f| f.set(true));
         ScopedGuard(())
     }
