@@ -3,12 +3,15 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::mpsc;
+use futures_util::StreamExt;
+use tokio::sync::{broadcast, mpsc};
+use tokio_tungstenite::tungstenite::Message;
 
 use heaplens_daemon::graph::OwnershipGraph;
 use heaplens_daemon::ingest;
-use heaplens_daemon::msg::GraphMsg;
+use heaplens_daemon::msg::{ConnectRequest, GraphMsg};
 use heaplens_daemon::resolver::Resolver;
+use heaplens_daemon::server;
 
 const PIPE_NAME: &str = r"\\.\pipe\heaplens";
 /// Minimum allocs expected: 100 nested_alloc calls × 2 Vec allocs each = 200.
@@ -50,6 +53,19 @@ async fn cross_process_wire_end_to_end() {
     let (tx, mut rx) = mpsc::unbounded_channel::<GraphMsg>();
     let ingest_tx = tx.clone();
 
+    // WS infrastructure — broadcast channel for diffs + connect-request channel.
+    let (broadcast_tx, _) = broadcast::channel::<Arc<heaplens_protocol::GraphMessage>>(64);
+    let (connect_tx, mut connect_rx) = mpsc::unbounded_channel::<ConnectRequest>();
+
+    // Pick a free port for the WS server.
+    let ws_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let ws_port = ws_listener.local_addr().unwrap().port();
+    drop(ws_listener);
+    let ws_addr = format!("127.0.0.1:{ws_port}");
+
+    tokio::spawn(server::run(ws_addr.clone(), connect_tx));
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
     // Start the pipe server BEFORE spawning the child.
     // ingest::run loops forever; we abort it after the child exits.
     let ingest_handle = tokio::spawn(ingest::run(PIPE_NAME.to_owned(), ingest_tx));
@@ -63,6 +79,8 @@ async fn cross_process_wire_end_to_end() {
         .unwrap_or_else(|e| panic!("failed to spawn wire_producer: {e}"));
 
     // Graph loop: runs in a background task, drains rx until closed or timeout.
+    // Also handles WS ConnectRequests via select! so clients can get a snapshot.
+    let broadcast_tx_clone = broadcast_tx.clone();
     let graph_handle = tokio::spawn(async move {
         let mut graph = OwnershipGraph::new();
         let resolver = Resolver::new();
@@ -80,32 +98,52 @@ async fn cross_process_wire_end_to_end() {
             if remaining.is_zero() {
                 break;
             }
-            match tokio::time::timeout(remaining, rx.recv()).await {
-                Ok(Some(GraphMsg::Events(events))) => {
-                    for ev in &events {
-                        match ev.kind {
-                            0 => {
-                                graph.on_alloc(ev);
-                                alloc_count += 1;
+            tokio::select! {
+                msg = rx.recv() => match msg {
+                    Some(GraphMsg::Events(events)) => {
+                        for ev in &events {
+                            match ev.kind {
+                                0 => {
+                                    graph.on_alloc(ev);
+                                    alloc_count += 1;
+                                }
+                                1 => graph.on_dealloc(ev.ptr),
+                                2 => graph.on_realloc(ev.old_ptr, ev.ptr, ev.size),
+                                _ => {}
                             }
-                            1 => graph.on_dealloc(ev.ptr),
-                            2 => graph.on_realloc(ev.old_ptr, ev.ptr, ev.size),
-                            _ => {}
+                        }
+                        // Drain diff after each batch so nodes allocated before deallocs
+                        // appear in the diff accumulator's "add" set and edge relationships
+                        // are captured before the nodes are freed.
+                        let diff = graph.drain_diff(&resolver);
+                        // Broadcast non-empty diffs so connected WS clients receive updates.
+                        let is_non_empty = matches!(
+                            &diff,
+                            heaplens_protocol::GraphMessage::Diff { add, update, remove, .. }
+                            if !add.is_empty() || !update.is_empty() || !remove.is_empty()
+                        );
+                        if is_non_empty {
+                            let _ = broadcast_tx_clone.send(Arc::new(diff.clone()));
+                        }
+                        if let heaplens_protocol::GraphMessage::Diff { add, update, .. } = diff {
+                            nodes_with_edges += add
+                                .iter()
+                                .chain(update.iter())
+                                .filter(|n| !n.edges.is_empty())
+                                .count();
                         }
                     }
-                    // Drain diff after each batch so nodes allocated before deallocs
-                    // appear in the diff accumulator's "add" set and edge relationships
-                    // are captured before the nodes are freed.
-                    let diff = graph.drain_diff(&resolver);
-                    if let heaplens_protocol::GraphMessage::Diff { add, update, .. } = diff {
-                        nodes_with_edges += add
-                            .iter()
-                            .chain(update.iter())
-                            .filter(|n| !n.edges.is_empty())
-                            .count();
+                    _ => break,
+                },
+                req = connect_rx.recv() => {
+                    if let Some(ConnectRequest { reply }) = req {
+                        // Subscribe to future diffs before snapshotting so no diffs are lost.
+                        let diff_rx = broadcast_tx_clone.subscribe();
+                        let snapshot = graph.snapshot(&resolver);
+                        let _ = reply.send((snapshot, diff_rx));
                     }
-                }
-                Ok(Some(GraphMsg::Tick)) | Ok(None) | Err(_) => break,
+                },
+                _ = tokio::time::sleep(remaining) => break,
             }
         }
 
@@ -145,6 +183,34 @@ async fn cross_process_wire_end_to_end() {
 
     // Give the daemon a 2-second drain window after child exits.
     tokio::time::sleep(Duration::from_secs(2)).await;
+
+    // WS snapshot assertion — performed while graph loop is still running so it
+    // can handle the ConnectRequest and return a snapshot.
+    // Note: by this point, wire_producer has freed all its allocations, so the
+    // snapshot's node list will be empty (all live=false). We assert structure only.
+    {
+        let ws_url = format!("ws://{ws_addr}");
+        let (mut ws_stream, _) = tokio_tungstenite::connect_async(&ws_url)
+            .await
+            .expect("failed to connect to WS server");
+
+        let first_msg = tokio::time::timeout(Duration::from_secs(5), ws_stream.next())
+            .await
+            .expect("WS receive timed out")
+            .expect("WS stream ended")
+            .expect("WS message error");
+
+        if let Message::Text(json) = first_msg {
+            let parsed: serde_json::Value =
+                serde_json::from_str(&json).expect("WS snapshot is not valid JSON");
+            assert_eq!(
+                parsed["type"], "snapshot",
+                "WS first message must be a snapshot; got: {parsed}"
+            );
+        } else {
+            panic!("expected Text WS message for snapshot, got: {first_msg:?}");
+        }
+    }
 
     // Stop the ingest task (releases its tx clone) and close the test's tx.
     ingest_handle.abort();
