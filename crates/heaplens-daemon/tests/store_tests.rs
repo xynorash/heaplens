@@ -34,7 +34,7 @@ async fn store_inserts_nodes() {
     let path = temp_db_path("insert");
     cleanup(&path);
 
-    let tx = store::open(&path).unwrap();
+    let (tx, _handle) = store::open(&path).unwrap();
     tx.send(StoreMsg::Nodes(vec![make_dto(1), make_dto(2), make_dto(3)]))
         .unwrap();
     tx.send(StoreMsg::Flush).unwrap();
@@ -54,7 +54,7 @@ async fn store_batches_on_timer() {
     let path = temp_db_path("batch");
     cleanup(&path);
 
-    let tx = store::open(&path).unwrap();
+    let (tx, _handle) = store::open(&path).unwrap();
     for i in 0..50u64 {
         tx.send(StoreMsg::Nodes(vec![make_dto(i)])).unwrap();
     }
@@ -76,7 +76,7 @@ async fn store_shutdown_flushes() {
     cleanup(&path);
 
     {
-        let tx = store::open(&path).unwrap();
+        let (tx, _handle) = store::open(&path).unwrap();
         tx.send(StoreMsg::Nodes(vec![make_dto(99)])).unwrap();
         tx.send(StoreMsg::Shutdown).unwrap();
         tokio::time::sleep(Duration::from_millis(200)).await;

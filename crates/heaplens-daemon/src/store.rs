@@ -15,7 +15,7 @@ use crate::msg::StoreMsg;
 /// The store thread collects `StoreMsg::Nodes` batches for up to 100ms, then
 /// commits all pending rows in a single transaction. `StoreMsg::Flush` triggers
 /// an early commit; `StoreMsg::Shutdown` commits any remaining rows and exits.
-pub fn open(path: &str) -> Result<tokio_mpsc::UnboundedSender<StoreMsg>> {
+pub fn open(path: &str) -> Result<(tokio_mpsc::UnboundedSender<StoreMsg>, std::thread::JoinHandle<()>)> {
     let conn = Connection::open(path)?;
 
     conn.execute_batch(
@@ -42,13 +42,24 @@ pub fn open(path: &str) -> Result<tokio_mpsc::UnboundedSender<StoreMsg>> {
         }
     });
 
-    // Store thread: owns Connection, batches inserts every 100ms
-    thread::spawn(move || {
+    // Store thread: owns Connection, batches inserts every 100ms on a fixed deadline.
+    let handle = thread::spawn(move || {
+        let batch_interval = Duration::from_millis(100);
         let mut batch: Vec<heaplens_protocol::NodeDto> = Vec::new();
+        let mut deadline = std::time::Instant::now() + batch_interval;
+
         loop {
-            match std_rx.recv_timeout(Duration::from_millis(100)) {
+            let now = std::time::Instant::now();
+            let timeout = if now >= deadline {
+                Duration::ZERO
+            } else {
+                deadline - now
+            };
+
+            match std_rx.recv_timeout(timeout) {
                 Ok(StoreMsg::Nodes(dtos)) => {
                     batch.extend(dtos);
+                    // Do NOT reset deadline — let it fire at the fixed interval.
                 }
                 Ok(StoreMsg::Flush) | Err(std_mpsc::RecvTimeoutError::Timeout) => {
                     if !batch.is_empty() {
@@ -57,6 +68,7 @@ pub fn open(path: &str) -> Result<tokio_mpsc::UnboundedSender<StoreMsg>> {
                         }
                         batch.clear();
                     }
+                    deadline = std::time::Instant::now() + batch_interval;
                 }
                 Ok(StoreMsg::Shutdown) | Err(std_mpsc::RecvTimeoutError::Disconnected) => {
                     if !batch.is_empty() {
@@ -71,12 +83,18 @@ pub fn open(path: &str) -> Result<tokio_mpsc::UnboundedSender<StoreMsg>> {
         }
     });
 
-    Ok(tokio_tx)
+    Ok((tokio_tx, handle))
 }
 
 fn commit_batch(conn: &Connection, batch: &[heaplens_protocol::NodeDto]) -> Result<()> {
     let tx = conn.unchecked_transaction()?;
     for dto in batch {
+        // Serialize state using serde so the DB value matches the WS wire format
+        // (e.g. "healthy" not "Healthy").
+        let state_str = serde_json::to_value(&dto.state)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+            .unwrap_or_else(|| format!("{:?}", dto.state));
         tx.execute(
             "INSERT INTO nodes (id, ptr, size, ts, symbol, state) \
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -86,7 +104,7 @@ fn commit_batch(conn: &Connection, batch: &[heaplens_protocol::NodeDto]) -> Resu
                 dto.size as i64,
                 dto.ts as i64,
                 &dto.symbol,
-                format!("{:?}", dto.state)
+                state_str
             ],
         )?;
     }

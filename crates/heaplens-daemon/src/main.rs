@@ -27,8 +27,9 @@ async fn main() -> anyhow::Result<()> {
     // 2. Load config.
     let config = Config::load();
 
-    // 3. Open SQLite store — returns a tokio mpsc sender.
-    let store_tx = store::open(&config.db_path)?;
+    // 3. Open SQLite store — returns a tokio mpsc sender and a join handle for
+    //    the store thread so we can wait for the final batch commit on shutdown.
+    let (store_tx, store_join) = store::open(&config.db_path)?;
 
     // 4. Broadcast channel for WS diffs (capacity 64).
     //    The initial receiver is intentionally dropped; clients subscribe via broadcast_tx.subscribe().
@@ -133,6 +134,11 @@ async fn main() -> anyhow::Result<()> {
             },
         }
     }
+
+    // Drop the sender so the store thread sees Disconnected (or it already
+    // received Shutdown from the ctrl_c arm) and flushes its final batch.
+    drop(store_tx);
+    let _ = store_join.join();
 
     Ok(())
 }
