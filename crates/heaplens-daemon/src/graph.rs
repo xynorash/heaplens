@@ -18,6 +18,8 @@ pub struct Node {
     pub edges_out: Vec<u64>,
     /// True once an owner was assigned and then freed — used by M4 orphan detection.
     pub had_owner_once: bool,
+    /// Current anomaly classification; updated by anomaly::sweep.
+    pub state: NodeState,
 }
 
 pub struct OwnershipGraph {
@@ -71,6 +73,7 @@ impl OwnershipGraph {
             owner: owner_id,
             edges_out: Vec::new(),
             had_owner_once: owner_id.is_some(),
+            state: NodeState::Healthy,
         };
 
         // Register as a child of the owner.
@@ -217,7 +220,7 @@ impl OwnershipGraph {
             ts: n.ts,
             symbol,
             live: n.live,
-            state: NodeState::Healthy, // M3: no anomaly detection
+            state: n.state.clone(),
             edges: n.edges_out.clone(),
         }
     }

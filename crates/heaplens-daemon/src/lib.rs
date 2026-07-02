@@ -1,3 +1,4 @@
+pub mod anomaly;
 pub mod config;
 pub mod graph;
 pub mod ingest;
