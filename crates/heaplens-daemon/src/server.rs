@@ -73,7 +73,7 @@ async fn handle_client(
     // Send the initial full snapshot.
     match serde_json::to_string(&snapshot) {
         Ok(json) => {
-            if ws_sink.send(Message::Text(json.into())).await.is_err() {
+            if ws_sink.send(Message::Text(json)).await.is_err() {
                 return;
             }
         }
@@ -88,7 +88,7 @@ async fn handle_client(
         match diff_rx.recv().await {
             Ok(diff) => match serde_json::to_string(diff.as_ref()) {
                 Ok(json) => {
-                    if ws_sink.send(Message::Text(json.into())).await.is_err() {
+                    if ws_sink.send(Message::Text(json)).await.is_err() {
                         info!("WS client {peer} disconnected");
                         break;
                     }

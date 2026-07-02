@@ -34,11 +34,11 @@ pub fn sweep(nodes: &mut HashMap<u64, Node>, max_ts_seen: u64, config: &Config) 
         }
 
         // Hot-cluster check (only reached when node is not Orphan this pass).
-        if node.live && node.edges_out.len() > config.hot_cluster_threshold {
-            if node.state != NodeState::Hot {
-                node.state = NodeState::Hot;
-                changed.push(node.id);
-            }
+        if node.live && node.edges_out.len() > config.hot_cluster_threshold
+            && node.state != NodeState::Hot
+        {
+            node.state = NodeState::Hot;
+            changed.push(node.id);
         }
 
         // TODO: reset state to Healthy when conditions no longer hold (not yet implemented — spec is silent on reset)
