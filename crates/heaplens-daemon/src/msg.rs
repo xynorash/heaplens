@@ -1,4 +1,6 @@
-use heaplens_protocol::{AllocEvent, NodeDto};
+use std::sync::Arc;
+use tokio::sync::{broadcast, oneshot};
+use heaplens_protocol::{AllocEvent, GraphMessage, NodeDto};
 
 /// Messages sent from the ingest task to the graph task via mpsc.
 pub enum GraphMsg {
@@ -6,6 +8,12 @@ pub enum GraphMsg {
     Events(Vec<AllocEvent>),
     /// Periodic tick from the timer — triggers drain_diff and log emission.
     Tick,
+}
+
+/// Request sent to the graph task when a new WebSocket client connects.
+/// The graph task replies with a snapshot and a broadcast receiver for diffs.
+pub struct ConnectRequest {
+    pub reply: oneshot::Sender<(GraphMessage, broadcast::Receiver<Arc<GraphMessage>>)>,
 }
 
 /// Messages sent to the store task.
