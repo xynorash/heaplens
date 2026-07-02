@@ -25,17 +25,23 @@ pub fn sweep(nodes: &mut HashMap<u64, Node>, max_ts_seen: u64, config: &Config) 
             && node.had_owner_once
             && max_ts_seen.saturating_sub(node.ts) > config.tau_ms * 1_000_000
         {
-            node.state = NodeState::Orphan;
-            changed.push(node.id);
+            if node.state != NodeState::Orphan {
+                node.state = NodeState::Orphan;
+                changed.push(node.id);
+            }
             // Q4: orphan wins — skip hot check
             continue;
         }
 
         // Hot-cluster check (only reached when node is not Orphan this pass).
         if node.live && node.edges_out.len() > config.hot_cluster_threshold {
-            node.state = NodeState::Hot;
-            changed.push(node.id);
+            if node.state != NodeState::Hot {
+                node.state = NodeState::Hot;
+                changed.push(node.id);
+            }
         }
+
+        // TODO: reset state to Healthy when conditions no longer hold (not yet implemented — spec is silent on reset)
     }
 
     changed
