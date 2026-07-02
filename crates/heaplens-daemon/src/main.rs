@@ -63,6 +63,7 @@ async fn main() -> anyhow::Result<()> {
     let mut graph = OwnershipGraph::new();
     let resolver = Resolver::new();
     let mut storm_tracker = StormTracker::new();
+    let mut warned_sites: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
     // Graph loop — single-threaded owner of all graph state.
     loop {
@@ -76,6 +77,7 @@ async fn main() -> anyhow::Result<()> {
                                 // Storm detection on alloc events with a non-empty stack.
                                 if ev.stack_len > 0
                                     && storm_tracker.record(ev.stack[0], ev.ts_nanos, &config)
+                                    && warned_sites.insert(ev.stack[0])
                                 {
                                     warn!(
                                         addr = ev.stack[0],
@@ -90,6 +92,7 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 Some(GraphMsg::Tick) => {
+                    warned_sites.clear();
                     // Anomaly sweep — returns ids of nodes whose state changed.
                     let max_ts = graph.max_ts_seen;
                     let changed = sweep(graph.nodes_mut(), max_ts, &config);
