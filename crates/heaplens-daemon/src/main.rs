@@ -1,11 +1,19 @@
-use tokio::sync::mpsc;
+use std::sync::Arc;
+use tokio::sync::{broadcast, mpsc};
+use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-use heaplens_daemon::config::Config;
-use heaplens_daemon::graph::OwnershipGraph;
-use heaplens_daemon::ingest;
-use heaplens_daemon::msg::GraphMsg;
-use heaplens_daemon::resolver::Resolver;
+use heaplens_daemon::{
+    anomaly::{sweep, StormTracker},
+    config::Config,
+    graph::OwnershipGraph,
+    ingest,
+    msg::{ConnectRequest, GraphMsg, StoreMsg},
+    resolver::Resolver,
+    server,
+    store,
+};
+use heaplens_protocol::GraphMessage;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -16,20 +24,33 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    // 2. Load config (pipe name, tick interval).
+    // 2. Load config.
     let config = Config::load();
 
-    // 3. Create the mpsc channel that connects ingest + timer → graph loop.
+    // 3. Open SQLite store — returns a tokio mpsc sender.
+    let store_tx = store::open(&config.db_path)?;
+
+    // 4. Broadcast channel for WS diffs (capacity 64).
+    //    The initial receiver is intentionally dropped; clients subscribe via broadcast_tx.subscribe().
+    let (broadcast_tx, _) = broadcast::channel::<Arc<GraphMessage>>(64);
+
+    // 5. Connect-request channel (WS clients request snapshot + subscription).
+    let (connect_tx, mut connect_rx) = mpsc::unbounded_channel::<ConnectRequest>();
+
+    // 6. WS server.
+    tokio::spawn(server::run(config.ws_addr.clone(), connect_tx));
+
+    // 7. Ingest channel.
     let (tx, mut rx) = mpsc::unbounded_channel::<GraphMsg>();
 
-    // 4 & 5. Clone tx for the timer *before* moving tx into the ingest task.
+    // 8. Ingest task — clone tx before moving it.
     let tick_tx = tx.clone();
     tokio::spawn(ingest::run(config.pipe_name.clone(), tx));
 
+    // 9. Timer task — fires GraphMsg::Tick every tick_ms milliseconds.
     let tick_ms = config.tick_ms;
     tokio::spawn(async move {
-        let mut interval =
-            tokio::time::interval(tokio::time::Duration::from_millis(tick_ms));
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_millis(tick_ms));
         loop {
             interval.tick().await;
             if tick_tx.send(GraphMsg::Tick).is_err() {
@@ -38,17 +59,30 @@ async fn main() -> anyhow::Result<()> {
         }
     });
 
-    // 6 & 7. Graph loop — owns graph state and runs on the main task.
+    // 10. Graph state.
     let mut graph = OwnershipGraph::new();
     let resolver = Resolver::new();
+    let mut storm_tracker = StormTracker::new();
 
+    // Graph loop — single-threaded owner of all graph state.
     loop {
         tokio::select! {
             msg = rx.recv() => match msg {
                 Some(GraphMsg::Events(events)) => {
                     for ev in &events {
                         match ev.kind {
-                            0 => graph.on_alloc(ev),
+                            0 => {
+                                graph.on_alloc(ev);
+                                // Storm detection on alloc events with a non-empty stack.
+                                if ev.stack_len > 0
+                                    && storm_tracker.record(ev.stack[0], ev.ts_nanos, &config)
+                                {
+                                    warn!(
+                                        addr = ev.stack[0],
+                                        "allocation storm at site 0x{:x}", ev.stack[0]
+                                    );
+                                }
+                            }
                             1 => graph.on_dealloc(ev.ptr),
                             2 => graph.on_realloc(ev.old_ptr, ev.ptr, ev.size),
                             _ => {}
@@ -56,30 +90,55 @@ async fn main() -> anyhow::Result<()> {
                     }
                 }
                 Some(GraphMsg::Tick) => {
-                    let diff = graph.drain_diff(&resolver);
-                    if let Ok(json) = serde_json::to_string(&diff) {
-                        println!("{json}");
+                    // Anomaly sweep — returns ids of nodes whose state changed.
+                    let max_ts = graph.max_ts_seen;
+                    let changed = sweep(graph.nodes_mut(), max_ts, &config);
+                    for id in changed {
+                        graph.mark_updated(id);
                     }
-                    if let heaplens_protocol::GraphMessage::Diff {
-                        ref add,
-                        ref update,
-                        ref remove,
-                        ..
-                    } = diff
-                    {
-                        tracing::debug!(
-                            add = add.len(),
-                            update = update.len(),
-                            remove = remove.len(),
-                            "tick diff"
-                        );
+
+                    let diff = graph.drain_diff(&resolver);
+
+                    // Forward new/updated nodes to the store.
+                    if let GraphMessage::Diff { ref add, ref update, .. } = diff {
+                        let dtos: Vec<_> = add.iter().chain(update.iter()).cloned().collect();
+                        if !dtos.is_empty() {
+                            let _ = store_tx.send(StoreMsg::Nodes(dtos));
+                        }
+                    }
+
+                    // Broadcast non-empty diffs to WS clients.
+                    if is_non_empty_diff(&diff) {
+                        let _ = broadcast_tx.send(Arc::new(diff));
                     }
                 }
                 None => break,
             },
-            _ = tokio::signal::ctrl_c() => break,
+            req = connect_rx.recv() => {
+                if let Some(ConnectRequest { reply }) = req {
+                    // Q6: subscribe BEFORE taking snapshot so no diffs are lost
+                    // between the two operations (no await between them).
+                    let diff_rx = broadcast_tx.subscribe();
+                    let snapshot = graph.snapshot(&resolver);
+                    let _ = reply.send((snapshot, diff_rx));
+                }
+            },
+            _ = tokio::signal::ctrl_c() => {
+                info!("shutting down");
+                let _ = store_tx.send(StoreMsg::Shutdown);
+                break;
+            },
         }
     }
 
     Ok(())
+}
+
+fn is_non_empty_diff(msg: &GraphMessage) -> bool {
+    match msg {
+        GraphMessage::Diff { add, update, remove, .. } => {
+            !add.is_empty() || !update.is_empty() || !remove.is_empty()
+        }
+        GraphMessage::Snapshot { .. } => false,
+    }
 }
