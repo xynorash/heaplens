@@ -21,9 +21,7 @@ pub async fn run(addr: String, connect_tx: mpsc::UnboundedSender<ConnectRequest>
             return;
         }
     };
-    let bound = listener
-        .local_addr()
-        .unwrap_or_else(|_| addr.parse().unwrap_or_else(|_| "0.0.0.0:9999".parse().unwrap()));
+    let bound = listener.local_addr().map(|a| a.to_string()).unwrap_or_else(|_| addr.clone());
     info!("WebSocket server listening on {bound}");
 
     loop {
