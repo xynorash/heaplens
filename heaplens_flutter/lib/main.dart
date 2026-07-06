@@ -188,6 +188,20 @@ class _GraphOrchestratorState extends ConsumerState<_GraphOrchestrator> {
         for (final n in diff.add) {
           layout.addNode(n, currentNodes);
         }
+        // Note: an `update` whose `NodeDto.state == NodeStateDto.freed`
+        // intentionally does not trigger `layout.removeNode` here — only a
+        // `remove` (handled below) or a fresh `resetFrom`-driven cleanup
+        // does. This is currently a non-issue in practice: as of this
+        // writing, heaplens-daemon's node-state machine
+        // (crates/heaplens-daemon/src/anomaly.rs) only ever assigns
+        // `NodeState::Healthy`, `::Orphan`, or `::Hot` — `NodeState::Freed`
+        // is defined on the wire (heaplens-protocol/src/diff.rs) but nothing
+        // in the daemon ever constructs it for a live node's `update`. A
+        // `freed` node's lifecycle is expected to always end via a `remove`
+        // diff entry instead. If the daemon's state machine changes to emit
+        // `freed` on an `update`, this call site would need to start
+        // treating that as a fade trigger too (calling `layout.removeNode`
+        // for it) rather than leaving it solid and non-fading forever.
         for (final n in diff.update) {
           layout.updateNode(n);
         }

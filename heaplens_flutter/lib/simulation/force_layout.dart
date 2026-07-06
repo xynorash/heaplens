@@ -83,11 +83,26 @@ class SimNode {
   /// the instant it reaches 0.
   double fade;
 
+  /// The node's last-known [NodeStateDto] at the moment [ForceLayout.removeNode]
+  /// (or the aggregate-membership equivalent) started this node's fade-out.
+  ///
+  /// `null` for the whole life of a normal, non-fading [SimNode] — it is only
+  /// populated at the instant a fade begins, from whatever `NodeDto` state
+  /// was last known for this id (via [ForceLayout._rawNodes]) before that
+  /// entry is deleted. This is what lets a painter render a fading node's
+  /// color purely from [ForceLayout.simNodes] data, without needing a live
+  /// `NodeDto` for the id — by the time the fade is visibly progressing, the
+  /// backing `NodeDto` has typically already been removed from the graph
+  /// provider's node map (see the design note on `GraphPainter._paintNodes`
+  /// in graph_canvas.dart).
+  NodeStateDto? lastKnownState;
+
   SimNode({
     required this.position,
     required this.velocity,
     required this.radius,
     this.fade = 1.0,
+    this.lastKnownState,
   });
 }
 
@@ -254,8 +269,13 @@ class ForceLayout {
   /// Begins a fade-out for [id] (a diff `remove`, or a freed node). Does
   /// NOT delete the [SimNode] immediately — [step] advances the fade and
   /// deletes it once [kFadeDurationSeconds] of simulated time has elapsed.
+  ///
+  /// Captures the outgoing node's last-known [NodeDto.state] onto
+  /// [SimNode.lastKnownState] *before* [_rawNodes] forgets it, so a painter
+  /// can render the correct color throughout the fade using [simNodes]
+  /// alone — see the doc on [SimNode.lastKnownState] for why this is needed.
   void removeNode(int id) {
-    _rawNodes.remove(id);
+    final outgoing = _rawNodes.remove(id);
 
     if (_aggregated) {
       _removeFromAggregate(id);
@@ -264,6 +284,7 @@ class ForceLayout {
 
     if (simNodes.containsKey(id) && !_fadeRemaining.containsKey(id)) {
       _fadeRemaining[id] = kFadeDurationSeconds;
+      simNodes[id]!.lastKnownState = outgoing?.state ?? NodeStateDto.freed;
     }
   }
 
@@ -424,6 +445,10 @@ class ForceLayout {
       if (simNodes.containsKey(ownerKey) &&
           !_fadeRemaining.containsKey(ownerKey)) {
         _fadeRemaining[ownerKey] = kFadeDurationSeconds;
+        // An aggregate bucket represents many raw nodes with potentially
+        // different states; `freed` (gray) is the least-surprising fade
+        // color for "this whole symbol-bucket emptied out".
+        simNodes[ownerKey]!.lastKnownState = NodeStateDto.freed;
       }
     } else {
       _recomputeAggregateRadius(ownerKey);

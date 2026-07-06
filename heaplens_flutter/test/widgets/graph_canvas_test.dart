@@ -6,6 +6,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:heaplens_flutter/models/graph_diff.dart';
 import 'package:heaplens_flutter/models/node.dart';
+import 'package:heaplens_flutter/providers/filter_providers.dart';
 import 'package:heaplens_flutter/providers/graph_provider.dart';
 import 'package:heaplens_flutter/providers/selection_provider.dart';
 import 'package:heaplens_flutter/providers/ws_provider.dart';
@@ -188,5 +189,143 @@ void main() {
 
     // selectedNodeIdProvider should remain null/unchanged.
     expect(container.read(selectedNodeIdProvider), isNull);
+  });
+
+  testWidgets(
+      'a removed node keeps painting (fading ghost) after its NodeDto is '
+      'gone from the graph provider map', (tester) async {
+    final controller = StreamController<GraphMessage>();
+    addTearDown(() => controller.close());
+
+    final layout = ForceLayout(centerX: 200, centerY: 200, random: Random(4));
+    final node = _node(id: 77, state: NodeStateDto.orphan);
+    layout.addNode(node, {77: node});
+
+    late ProviderContainer container;
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          graphMessageProvider.overrideWith((ref) => controller.stream),
+        ],
+        child: Consumer(
+          builder: (context, ref, _) {
+            container = ProviderScope.containerOf(context);
+            return MaterialApp(
+              home: Scaffold(
+                body: SizedBox(
+                  width: 400,
+                  height: 400,
+                  child: GraphCanvas(layout: layout),
+                ),
+              ),
+            );
+          },
+        ),
+      ),
+    );
+
+    container
+        .read(graphProvider.notifier)
+        .applyDiff(GraphSnapshot(ts: 1, nodes: [node]));
+    await tester.pump();
+    expect(tester.takeException(), isNull);
+
+    // Mirror main.dart's orchestrator: the same message-processing step
+    // removes the NodeDto from graph_provider's map AND starts the
+    // ForceLayout fade for the same id.
+    container.read(graphProvider.notifier).applyDiff(
+          const GraphDiff(ts: 2, add: [], update: [], remove: [77]),
+        );
+    layout.removeNode(77);
+    await tester.pump();
+
+    // NodeDto is gone...
+    expect(
+      container.read(graphProvider.notifier).nodes.containsKey(77),
+      isFalse,
+    );
+    // ...but the SimNode is still mid-fade, with a captured last-known
+    // state, and the widget must keep painting it without throwing.
+    expect(layout.simNodes.containsKey(77), isTrue);
+    expect(layout.simNodes[77]!.lastKnownState, equals(NodeStateDto.orphan));
+    expect(tester.takeException(), isNull);
+
+    // Advance the fade partway and pump again: still mid-fade, still must
+    // render without crashing.
+    layout.step(0.5);
+    await tester.pump();
+    expect(layout.simNodes.containsKey(77), isTrue);
+    expect(layout.simNodes[77]!.fade, lessThan(1.0));
+    expect(layout.simNodes[77]!.fade, greaterThan(0.0));
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets(
+      'min-size filter hides a node from graph-view painting and hit-testing',
+      (tester) async {
+    final controller = StreamController<GraphMessage>();
+    addTearDown(() => controller.close());
+
+    final layout = ForceLayout(centerX: 200, centerY: 200, random: Random(6));
+    final small = _node(id: 1, size: 8);
+    final big = _node(id: 2, size: 4096);
+    layout.addNode(small, {1: small, 2: big});
+    layout.addNode(big, {1: small, 2: big});
+    // Pin positions so we know exactly where to tap.
+    layout.simNodes[1]!.position.setValues(100, 100);
+    layout.simNodes[1]!.radius = 20;
+    layout.simNodes[2]!.position.setValues(300, 300);
+    layout.simNodes[2]!.radius = 20;
+
+    late ProviderContainer container;
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          graphMessageProvider.overrideWith((ref) => controller.stream),
+        ],
+        child: Consumer(
+          builder: (context, ref, _) {
+            container = ProviderScope.containerOf(context);
+            return MaterialApp(
+              home: Scaffold(
+                body: SizedBox(
+                  width: 400,
+                  height: 400,
+                  child: GraphCanvas(layout: layout),
+                ),
+              ),
+            );
+          },
+        ),
+      ),
+    );
+
+    container
+        .read(graphProvider.notifier)
+        .applyDiff(GraphSnapshot(ts: 1, nodes: [small, big]));
+    await tester.pump();
+
+    // Before filtering: tapping the small node selects it.
+    await tester.tapAt(const Offset(100, 100));
+    await tester.pump();
+    expect(container.read(selectedNodeIdProvider), 1);
+
+    container.read(selectedNodeIdProvider.notifier).state = null;
+    container.read(minSizeFilterProvider.notifier).state = 100;
+    await tester.pump();
+    expect(tester.takeException(), isNull);
+
+    // After filtering: the small node is hidden from hit-testing...
+    await tester.tapAt(const Offset(100, 100));
+    await tester.pump();
+    expect(container.read(selectedNodeIdProvider), isNull);
+
+    // ...but the big node remains tappable...
+    await tester.tapAt(const Offset(300, 300));
+    await tester.pump();
+    expect(container.read(selectedNodeIdProvider), 2);
+
+    // ...and the underlying node map is untouched by the filter.
+    expect(container.read(graphProvider.notifier).nodes.length, 2);
   });
 }

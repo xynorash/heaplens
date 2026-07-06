@@ -133,6 +133,47 @@ void main() {
     });
   });
 
+  group('removeNode captures lastKnownState for fade rendering', () {
+    test('captures the outgoing NodeDto.state onto SimNode.lastKnownState',
+        () {
+      final layout = ForceLayout(random: Random(3));
+      final node = _node(id: 9, state: NodeStateDto.orphan);
+      layout.addNode(node, {9: node});
+
+      expect(layout.simNodes[9]!.lastKnownState, isNull);
+
+      layout.removeNode(9);
+
+      expect(layout.simNodes[9]!.lastKnownState, equals(NodeStateDto.orphan));
+      // The captured state must survive across the fade, since the painter
+      // needs it on every frame until the SimNode is finally deleted.
+      layout.step(0.5);
+      expect(layout.simNodes[9]!.lastKnownState, equals(NodeStateDto.orphan));
+    });
+
+    test('aggregate bucket emptying out also captures a lastKnownState', () {
+      final layout = ForceLayout(random: Random(5));
+      for (var i = 0; i < kAggregationThreshold + 1; i++) {
+        final n = _node(id: i, symbol: 'sym_${i % 10}');
+        layout.addNode(n, {i: n});
+      }
+      layout.step(0.016);
+      expect(layout.isAggregated, isTrue);
+
+      // Drain every member of symbol 'sym_0' (ids 0, 10, 20, ...).
+      for (var i = 0; i < kAggregationThreshold + 1; i += 10) {
+        layout.removeNode(i);
+      }
+
+      // Find the (now fading) aggregate SimNode: any negative-id key still
+      // present with a non-null lastKnownState.
+      final fadingAgg = layout.simNodes.entries
+          .where((e) => e.key < 0 && e.value.lastKnownState != null)
+          .toList();
+      expect(fadingAgg, isNotEmpty);
+    });
+  });
+
   group('aggregation (ENF9)', () {
     test('does not activate at exactly the threshold', () {
       final layout = ForceLayout(random: Random(5));
