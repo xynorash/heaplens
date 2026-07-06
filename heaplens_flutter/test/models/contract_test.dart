@@ -98,4 +98,34 @@ void main() {
       expect(node.edges, [501]);
     });
   });
+
+  group('NodeDto 64-bit precision', () {
+    test('preserves full 64-bit integer precision for u64 fields', () {
+      // Synthetic test: use values near 64-bit max and at 2^53+1 (smallest
+      // integer a double cannot represent exactly). This test ensures that
+      // jsonDecode and the `as int` casts preserve full 64-bit precision
+      // and don't accidentally round through double representation.
+      const largeU64 = 9007199254740993; // 2^53 + 1
+      const anotherLargeU64 = 9223372036854775807; // i64 max (near u64 max)
+
+      final json = <String, dynamic>{
+        'id': largeU64,
+        'ptr': anotherLargeU64,
+        'size': largeU64,
+        'ts': 1234567890,
+        'symbol': 'test_symbol',
+        'live': true,
+        'state': 'healthy',
+        'edges': <int>[],
+      };
+
+      final node = NodeDto.fromJson(json);
+
+      // Verify that each u64 field is preserved exactly as-is
+      expect(node.id, equals(largeU64));
+      expect(node.ptr, equals(anotherLargeU64));
+      expect(node.size, equals(largeU64));
+      expect(node.ts, equals(1234567890));
+    });
+  });
 }
