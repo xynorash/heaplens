@@ -4,6 +4,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../models/graph_diff.dart';
 import '../models/node.dart';
+import 'paused_provider.dart';
 import 'ws_provider.dart';
 
 /// Owns the live ownership-graph node map and republishes a monotonically
@@ -29,7 +30,13 @@ class GraphNotifier extends Notifier<int> {
     // Automatically wire up to the live WS message stream: every message
     // that actually arrives is applied here. Widgets never need to feed
     // messages into this notifier manually.
+    // Pause/resume (control bar, M5 task-6): while paused, incoming messages
+    // are dropped rather than applied — see paused_provider.dart doc for the
+    // rationale. This is a plain `ref.read` (not `ref.watch`) because we only
+    // need the *current* value at the moment each message arrives; the
+    // notifier itself must not rebuild when pause state changes.
     ref.listen<AsyncValue<GraphMessage>>(graphMessageProvider, (previous, next) {
+      if (ref.read(pausedProvider)) return;
       next.whenData(applyDiff);
     });
     return 0;
