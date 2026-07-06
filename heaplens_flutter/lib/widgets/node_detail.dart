@@ -80,6 +80,16 @@ class _NodeDetailState extends ConsumerState<NodeDetail> {
   /// it's fed changes.
   final SparklineBuffer _buffer = SparklineBuffer();
 
+  /// Client-side rolling max of `ts` across all nodes ever seen, analogous
+  /// to the daemon's own `max_ts_seen` (see graph.rs:
+  /// `self.max_ts_seen = self.max_ts_seen.max(ev.ts_nanos)`). Monotonic --
+  /// updated only via `.max()` against the current live-node scan, so it
+  /// never decreases even when the node carrying the current max is later
+  /// removed by a `remove` diff. Persisted on the state (not recomputed
+  /// from scratch each build) precisely so that churn like alloc-then-free
+  /// can't make a selected node's displayed `age` visibly snap backwards.
+  int _maxTsSeen = 0;
+
   @override
   Widget build(BuildContext context) {
     ref.watch(graphProvider);
@@ -97,13 +107,14 @@ class _NodeDetailState extends ConsumerState<NodeDetail> {
     final node = nodes[selectedId]!;
     _buffer.record(node);
 
-    int maxTsSeen = node.ts;
+    int scanMaxTs = node.ts;
     int? ownerId;
     for (final n in nodes.values) {
-      if (n.ts > maxTsSeen) maxTsSeen = n.ts;
+      if (n.ts > scanMaxTs) scanMaxTs = n.ts;
       if (n.edges.contains(selectedId)) ownerId = n.id;
     }
-    final age = maxTsSeen - node.ts;
+    _maxTsSeen = _maxTsSeen > scanMaxTs ? _maxTsSeen : scanMaxTs;
+    final age = _maxTsSeen - node.ts;
 
     return Padding(
       padding: const EdgeInsets.all(12),

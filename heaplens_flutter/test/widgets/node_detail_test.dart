@@ -151,6 +151,40 @@ void main() {
   });
 
   testWidgets(
+      'age does not decrease when the node carrying the max ts is removed',
+      (tester) async {
+    final controller = StreamController<GraphMessage>();
+    addTearDown(() => controller.close());
+    final container = await _pumpNodeDetail(tester, controller);
+
+    // Selected node has ts=100. A second node arrives with ts=300 (the
+    // current max), making age = 300 - 100 = 200.
+    final selected = _node(id: 1, ts: 100, symbol: 'selected');
+    final other = _node(id: 2, ts: 300, symbol: 'other');
+    container
+        .read(graphProvider.notifier)
+        .applyDiff(GraphSnapshot(ts: 1, nodes: [selected, other]));
+    container.read(selectedNodeIdProvider.notifier).state = 1;
+    await tester.pump();
+
+    expect(find.text('200'), findsOneWidget);
+
+    // Remove `other` -- the node that carried the observed max ts. A naive
+    // "recompute max from currently-live nodes" implementation would now
+    // see only `selected` (ts=100) and report age=0, i.e. age would
+    // visibly decrease. The rolling max must be persisted and monotonic,
+    // so age must stay at 200.
+    container.read(graphProvider.notifier).applyDiff(
+          GraphDiff(ts: 2, add: const [], update: const [], remove: const [2]),
+        );
+    await tester.pump();
+
+    expect(find.text('selected'), findsOneWidget);
+    expect(find.text('200'), findsOneWidget);
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets(
       'switching selection to a different node does not crash and shows '
       'the new node\'s data', (tester) async {
     final controller = StreamController<GraphMessage>();
