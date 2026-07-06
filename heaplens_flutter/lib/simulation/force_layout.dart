@@ -222,6 +222,35 @@ class ForceLayout {
     sim.radius = radiusForSize(node.size);
   }
 
+  /// Bulk reconciliation for a full-state `GraphSnapshot` (initial connect,
+  /// or a post-reconnect resync). Natural extension of the add/update/remove
+  /// trio above — not a hard reset like [_rebuildFromRaw] (which only fires
+  /// internally on an ENF9 aggregation-mode flip): existing tracked nodes
+  /// that are still present keep their [SimNode] (position/velocity
+  /// untouched, only `radius` refreshed via [updateNode]), so most nodes
+  /// surviving a reconnect don't visually jump.
+  ///
+  /// [nodes] is the snapshot's full node list. [currentNodes] is used solely
+  /// for owner lookups when spawning brand-new nodes (see [addNode]) — pass
+  /// a map built from [nodes] itself (rather than, say, a possibly-stale
+  /// external map) so owner lookups are self-contained within this one
+  /// snapshot and don't depend on any other provider's state.
+  void resetFrom(List<NodeDto> nodes, Map<int, NodeDto> currentNodes) {
+    final newIds = nodes.map((n) => n.id).toSet();
+    final staleIds =
+        _rawNodes.keys.where((id) => !newIds.contains(id)).toList();
+    for (final id in staleIds) {
+      removeNode(id);
+    }
+    for (final node in nodes) {
+      if (_rawNodes.containsKey(node.id)) {
+        updateNode(node);
+      } else {
+        addNode(node, currentNodes);
+      }
+    }
+  }
+
   /// Begins a fade-out for [id] (a diff `remove`, or a freed node). Does
   /// NOT delete the [SimNode] immediately — [step] advances the fade and
   /// deletes it once [kFadeDurationSeconds] of simulated time has elapsed.

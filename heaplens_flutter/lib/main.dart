@@ -1,121 +1,204 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
+import 'package:flutter_riverpod/flutter_riverpod.dart';
+
+import 'models/graph_diff.dart';
+import 'providers/force_layout_provider.dart';
+import 'providers/graph_provider.dart';
+import 'providers/paused_provider.dart';
+import 'providers/selection_provider.dart';
+import 'providers/view_mode_provider.dart';
+import 'providers/ws_provider.dart';
+import 'widgets/control_bar.dart';
+import 'widgets/graph_canvas.dart';
+import 'widgets/memory_map.dart';
+import 'widgets/node_detail.dart';
 
 void main() {
-  runApp(const MyApp());
+  runApp(const ProviderScope(child: HeapLensApp()));
 }
 
-class MyApp extends StatelessWidget {
-  const MyApp({super.key});
+/// Root widget: `MaterialApp` with a dark theme, wrapping the whole app in
+/// [_GraphOrchestrator] so the physics simulation is wired up regardless of
+/// which page/route is showing.
+class HeapLensApp extends StatelessWidget {
+  const HeapLensApp({super.key});
 
-  // This widget is the root of your application.
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
-      title: 'Flutter Demo',
-      theme: ThemeData(
-        // This is the theme of your application.
-        //
-        // TRY THIS: Try running your application with "flutter run". You'll see
-        // the application has a purple toolbar. Then, without quitting the app,
-        // try changing the seedColor in the colorScheme below to Colors.green
-        // and then invoke "hot reload" (save your changes or press the "hot
-        // reload" button in a Flutter-supported IDE, or press "r" if you used
-        // the command line to start the app).
-        //
-        // Notice that the counter didn't reset back to zero; the application
-        // state is not lost during the reload. To reset the state, use hot
-        // restart instead.
-        //
-        // This works for code too, not just values: Most code changes can be
-        // tested with just a hot reload.
-        colorScheme: .fromSeed(seedColor: Colors.deepPurple),
+      title: 'HeapLens',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData.dark(useMaterial3: true).copyWith(
+        scaffoldBackgroundColor: const Color(0xFF121212),
       ),
-      home: const MyHomePage(title: 'Flutter Demo Home Page'),
+      home: const _GraphOrchestrator(child: HeapLensHome()),
     );
   }
 }
 
-class MyHomePage extends StatefulWidget {
-  const MyHomePage({super.key, required this.title});
+/// Owns the app-lifetime physics ticker and the raw-message -> [ForceLayout]
+/// forwarding pipeline, then renders [child] beneath it.
+///
+/// ## Why a second, independent listener on `graphMessageProvider`
+///
+/// `graph_provider.dart`'s `GraphNotifier` already has its own internal
+/// `ref.listen(graphMessageProvider, ...)` that mutates its node map and
+/// bumps `revision`. [ForceLayout] needs to react to the exact same stream of
+/// events (to spawn/update/fade `SimNode`s), but it cannot be driven by
+/// diffing `graphProvider`'s revision changes, because that node map is
+/// mutated in place — there is no "before" snapshot left to diff against
+/// "after". So this widget sets up a *second*, independent
+/// `ref.listen(graphMessageProvider, ...)` that receives every raw
+/// [GraphMessage] as it arrives (in parallel with `graph_provider.dart`'s
+/// own listener) and forwards the appropriate add/update/remove calls to the
+/// shared [ForceLayout] from [forceLayoutProvider].
+///
+/// ## Listener-ordering hazard (read before touching this class)
+///
+/// For a `GraphDiff`'s `add` entries, [_ForceLayout.addNode] needs the
+/// *current* full node map (post-this-diff) to find each new node's owner.
+/// The brief instructs reading `ref.read(graphProvider.notifier).nodes` at
+/// the moment this listener runs, on the assumption that
+/// `graph_provider.dart`'s own listener for the same message has already run
+/// (Riverpod invokes multiple listeners on one provider in the order they
+/// were *registered*, not in some fixed "provider definition order"). That
+/// assumption is only safe if `GraphNotifier`'s listener is registered
+/// before this widget's — and widget build order does not guarantee that on
+/// its own (this widget is built as the *parent* of the tree that contains
+/// `ControlBar`, whose build is what normally first triggers
+/// `GraphNotifier.build()`, so naively this widget's listener would actually
+/// register FIRST and fire first, seeing stale state for that one message).
+///
+/// To make this deterministic rather than relying on incidental widget-tree
+/// shape, [initState] force-reads `graphProvider` (via `ref.read`) before
+/// this widget's own `build()` (and therefore its own `ref.listen` call)
+/// ever runs. That guarantees `GraphNotifier.build()` — and hence its
+/// internal `ref.listen` registration — happens first, every time,
+/// regardless of where in the widget tree `ControlBar`/`GraphCanvas` end up.
+/// This is intentional and load-bearing; do not remove the `ref.read
+/// (graphProvider)` call in [initState] without re-checking this ordering
+/// argument still holds.
+class _GraphOrchestrator extends ConsumerStatefulWidget {
+  const _GraphOrchestrator({required this.child});
 
-  // This widget is the home page of your application. It is stateful, meaning
-  // that it has a State object (defined below) that contains fields that affect
-  // how it looks.
-
-  // This class is the configuration for the state. It holds the values (in this
-  // case the title) provided by the parent (in this case the App widget) and
-  // used by the build method of the State. Fields in a Widget subclass are
-  // always marked "final".
-
-  final String title;
+  final Widget child;
 
   @override
-  State<MyHomePage> createState() => _MyHomePageState();
+  ConsumerState<_GraphOrchestrator> createState() => _GraphOrchestratorState();
 }
 
-class _MyHomePageState extends State<MyHomePage> {
-  int _counter = 0;
+class _GraphOrchestratorState extends ConsumerState<_GraphOrchestrator> {
+  /// Physics tick rate, decoupled from `graph_canvas.dart`'s own 60fps
+  /// render-clock `AnimationController` (used only for the pulsing-ring
+  /// effect). ~30 Hz is plenty for smooth-looking force-directed motion.
+  static const Duration _physicsInterval = Duration(milliseconds: 33);
 
-  void _incrementCounter() {
-    setState(() {
-      // This call to setState tells the Flutter framework that something has
-      // changed in this State, which causes it to rerun the build method below
-      // so that the display can reflect the updated values. If we changed
-      // _counter without calling setState(), then the build method would not be
-      // called again, and so nothing would appear to happen.
-      _counter++;
+  Timer? _physicsTimer;
+
+  @override
+  void initState() {
+    super.initState();
+
+    // Force `GraphNotifier.build()` to run now, registering its internal
+    // `ref.listen(graphMessageProvider, ...)` before this widget's own
+    // `build()` (and its own `ref.listen` call) executes. See the ordering
+    // note on the class doc above for why this matters.
+    ref.read(graphProvider);
+
+    final layout = ref.read(forceLayoutProvider);
+    final dtSeconds = _physicsInterval.inMicroseconds / 1e6;
+    _physicsTimer = Timer.periodic(_physicsInterval, (_) {
+      layout.step(dtSeconds);
     });
   }
 
   @override
+  void dispose() {
+    _physicsTimer?.cancel();
+    super.dispose();
+  }
+
+  void _handleMessage(GraphMessage message) {
+    // Mirror `graph_provider.dart`'s own pause gate exactly, so the physics
+    // simulation and the graph state stay consistent while paused — if only
+    // one side were gated, the visual would keep animating new nodes while
+    // the control bar's counters stayed frozen (or vice versa).
+    if (ref.read(pausedProvider)) return;
+
+    final layout = ref.read(forceLayoutProvider);
+    final currentNodes = ref.read(graphProvider.notifier).nodes;
+
+    switch (message) {
+      case GraphSnapshot snapshot:
+        // Full replace: use the snapshot's own node list (turned into a map)
+        // for owner lookups rather than `currentNodes`, so this doesn't
+        // depend on `graph_provider.dart` having already applied this exact
+        // snapshot — it's entirely self-contained.
+        final snapshotMap = {for (final n in snapshot.nodes) n.id: n};
+        layout.resetFrom(snapshot.nodes, snapshotMap);
+      case GraphDiff diff:
+        for (final n in diff.add) {
+          layout.addNode(n, currentNodes);
+        }
+        for (final n in diff.update) {
+          layout.updateNode(n);
+        }
+        for (final id in diff.remove) {
+          layout.removeNode(id);
+        }
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
-    // This method is rerun every time setState is called, for instance as done
-    // by the _incrementCounter method above.
-    //
-    // The Flutter framework has been optimized to make rerunning build methods
-    // fast, so that you can just rebuild anything that needs updating rather
-    // than having to individually change instances of widgets.
+    ref.listen<AsyncValue<GraphMessage>>(graphMessageProvider, (previous, next) {
+      next.whenData(_handleMessage);
+    });
+    return widget.child;
+  }
+}
+
+/// Top-level page layout: control bar across the top, the graph canvas or
+/// memory map filling the center (toggled by [viewModeProvider]), and a
+/// collapsible node-detail panel on the right (hidden entirely when nothing
+/// is selected).
+class HeapLensHome extends ConsumerWidget {
+  const HeapLensHome({super.key});
+
+  @override
+  Widget build(BuildContext context, WidgetRef ref) {
+    final viewMode = ref.watch(viewModeProvider);
+    final selectedId = ref.watch(selectedNodeIdProvider);
+    final layout = ref.watch(forceLayoutProvider);
+
     return Scaffold(
-      appBar: AppBar(
-        // TRY THIS: Try changing the color here to a specific color (to
-        // Colors.amber, perhaps?) and trigger a hot reload to see the AppBar
-        // change color while the other colors stay the same.
-        backgroundColor: Theme.of(context).colorScheme.inversePrimary,
-        // Here we take the value from the MyHomePage object that was created by
-        // the App.build method, and use it to set our appbar title.
-        title: Text(widget.title),
-      ),
-      body: Center(
-        // Center is a layout widget. It takes a single child and positions it
-        // in the middle of the parent.
+      body: SafeArea(
         child: Column(
-          // Column is also a layout widget. It takes a list of children and
-          // arranges them vertically. By default, it sizes itself to fit its
-          // children horizontally, and tries to be as tall as its parent.
-          //
-          // Column has various properties to control how it sizes itself and
-          // how it positions its children. Here we use mainAxisAlignment to
-          // center the children vertically; the main axis here is the vertical
-          // axis because Columns are vertical (the cross axis would be
-          // horizontal).
-          //
-          // TRY THIS: Invoke "debug painting" (choose the "Toggle Debug Paint"
-          // action in the IDE, or press "p" in the console), to see the
-          // wireframe for each widget.
-          mainAxisAlignment: .center,
           children: [
-            const Text('You have pushed the button this many times:'),
-            Text(
-              '$_counter',
-              style: Theme.of(context).textTheme.headlineMedium,
+            const ControlBar(),
+            Expanded(
+              child: Row(
+                children: [
+                  Expanded(
+                    child: switch (viewMode) {
+                      ViewMode.graph => GraphCanvas(layout: layout),
+                      ViewMode.memoryMap => const MemoryMap(),
+                    },
+                  ),
+                  if (selectedId != null)
+                    Container(
+                      key: const Key('nodeDetailPanel'),
+                      width: 320,
+                      color: const Color(0xFF1A1A1A),
+                      child: const NodeDetail(),
+                    ),
+                ],
+              ),
             ),
           ],
         ),
-      ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _incrementCounter,
-        tooltip: 'Increment',
-        child: const Icon(Icons.add),
       ),
     );
   }
