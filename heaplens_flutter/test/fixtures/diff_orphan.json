@@ -1,0 +1,20 @@
+{
+  "type": "diff",
+  "ts": 500000,
+  "add": [],
+  "update": [
+    {
+      "id": 500,
+      "ptr": 2505182948672,
+      "size": 128,
+      "ts": 323400,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "orphan",
+      "edges": [
+        501
+      ]
+    }
+  ],
+  "remove": []
+}

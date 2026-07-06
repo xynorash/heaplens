@@ -1,0 +1,1218 @@
+{
+  "type": "diff",
+  "ts": 329700,
+  "add": [
+    {
+      "id": 404,
+      "ptr": 2505182934288,
+      "size": 2400,
+      "ts": 100,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        405
+      ]
+    },
+    {
+      "id": 405,
+      "ptr": 2505182922736,
+      "size": 256,
+      "ts": 125100,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        406
+      ]
+    },
+    {
+      "id": 406,
+      "ptr": 2505182890544,
+      "size": 128,
+      "ts": 129100,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        407
+      ]
+    },
+    {
+      "id": 407,
+      "ptr": 2505182922192,
+      "size": 256,
+      "ts": 131200,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        408
+      ]
+    },
+    {
+      "id": 408,
+      "ptr": 2505182891264,
+      "size": 128,
+      "ts": 132900,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        409
+      ]
+    },
+    {
+      "id": 409,
+      "ptr": 2505182922464,
+      "size": 256,
+      "ts": 134600,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        410
+      ]
+    },
+    {
+      "id": 410,
+      "ptr": 2505182889392,
+      "size": 128,
+      "ts": 136200,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        411
+      ]
+    },
+    {
+      "id": 411,
+      "ptr": 2505182924912,
+      "size": 256,
+      "ts": 138000,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        412
+      ]
+    },
+    {
+      "id": 412,
+      "ptr": 2505182890832,
+      "size": 128,
+      "ts": 139900,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        413
+      ]
+    },
+    {
+      "id": 413,
+      "ptr": 2505182924368,
+      "size": 256,
+      "ts": 141900,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        414
+      ]
+    },
+    {
+      "id": 414,
+      "ptr": 2505182890976,
+      "size": 128,
+      "ts": 143500,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        415
+      ]
+    },
+    {
+      "id": 415,
+      "ptr": 2505182924640,
+      "size": 256,
+      "ts": 145200,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        416
+      ]
+    },
+    {
+      "id": 416,
+      "ptr": 2505182891120,
+      "size": 128,
+      "ts": 147000,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        417
+      ]
+    },
+    {
+      "id": 417,
+      "ptr": 2505182921920,
+      "size": 256,
+      "ts": 148900,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        418
+      ]
+    },
+    {
+      "id": 418,
+      "ptr": 2505182889104,
+      "size": 128,
+      "ts": 150900,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        419
+      ]
+    },
+    {
+      "id": 419,
+      "ptr": 2505182923824,
+      "size": 256,
+      "ts": 152800,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        420
+      ]
+    },
+    {
+      "id": 420,
+      "ptr": 2505182888672,
+      "size": 128,
+      "ts": 154600,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        421
+      ]
+    },
+    {
+      "id": 421,
+      "ptr": 2505182925184,
+      "size": 256,
+      "ts": 156300,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        422
+      ]
+    },
+    {
+      "id": 422,
+      "ptr": 2505182888816,
+      "size": 128,
+      "ts": 158000,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        423
+      ]
+    },
+    {
+      "id": 423,
+      "ptr": 2505182923008,
+      "size": 256,
+      "ts": 160000,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        424
+      ]
+    },
+    {
+      "id": 424,
+      "ptr": 2505182889968,
+      "size": 128,
+      "ts": 161900,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        425
+      ]
+    },
+    {
+      "id": 425,
+      "ptr": 2505182923280,
+      "size": 256,
+      "ts": 163700,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        426
+      ]
+    },
+    {
+      "id": 426,
+      "ptr": 2505182888960,
+      "size": 128,
+      "ts": 165600,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        427
+      ]
+    },
+    {
+      "id": 427,
+      "ptr": 2505182923552,
+      "size": 256,
+      "ts": 167400,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        428
+      ]
+    },
+    {
+      "id": 428,
+      "ptr": 2505182889536,
+      "size": 128,
+      "ts": 169200,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        429
+      ]
+    },
+    {
+      "id": 429,
+      "ptr": 2505182925456,
+      "size": 256,
+      "ts": 170500,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        430
+      ]
+    },
+    {
+      "id": 430,
+      "ptr": 2505182889248,
+      "size": 128,
+      "ts": 171500,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        431
+      ]
+    },
+    {
+      "id": 431,
+      "ptr": 2505182939776,
+      "size": 256,
+      "ts": 182700,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        432
+      ]
+    },
+    {
+      "id": 432,
+      "ptr": 2505182889680,
+      "size": 128,
+      "ts": 184900,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        433
+      ]
+    },
+    {
+      "id": 433,
+      "ptr": 2505182937600,
+      "size": 256,
+      "ts": 186300,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        434
+      ]
+    },
+    {
+      "id": 434,
+      "ptr": 2505182888384,
+      "size": 128,
+      "ts": 188200,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        435
+      ]
+    },
+    {
+      "id": 435,
+      "ptr": 2505182942768,
+      "size": 256,
+      "ts": 190100,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        436
+      ]
+    },
+    {
+      "id": 436,
+      "ptr": 2505182891408,
+      "size": 128,
+      "ts": 192000,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        437
+      ]
+    },
+    {
+      "id": 437,
+      "ptr": 2505182938144,
+      "size": 256,
+      "ts": 193800,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        438
+      ]
+    },
+    {
+      "id": 438,
+      "ptr": 2505182890688,
+      "size": 128,
+      "ts": 195300,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        439
+      ]
+    },
+    {
+      "id": 439,
+      "ptr": 2505182938960,
+      "size": 256,
+      "ts": 197000,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        440
+      ]
+    },
+    {
+      "id": 440,
+      "ptr": 2505182890256,
+      "size": 128,
+      "ts": 198700,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        441
+      ]
+    },
+    {
+      "id": 441,
+      "ptr": 2505182937056,
+      "size": 256,
+      "ts": 200500,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        442
+      ]
+    },
+    {
+      "id": 442,
+      "ptr": 2505182887664,
+      "size": 128,
+      "ts": 202100,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        443
+      ]
+    },
+    {
+      "id": 443,
+      "ptr": 2505182937872,
+      "size": 256,
+      "ts": 206300,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        444
+      ]
+    },
+    {
+      "id": 444,
+      "ptr": 2505182887808,
+      "size": 128,
+      "ts": 208300,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        445
+      ]
+    },
+    {
+      "id": 445,
+      "ptr": 2505182944128,
+      "size": 256,
+      "ts": 210100,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        446
+      ]
+    },
+    {
+      "id": 446,
+      "ptr": 2505182887952,
+      "size": 128,
+      "ts": 212000,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        447
+      ]
+    },
+    {
+      "id": 447,
+      "ptr": 2505182941136,
+      "size": 256,
+      "ts": 213700,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        448
+      ]
+    },
+    {
+      "id": 448,
+      "ptr": 2505182888096,
+      "size": 128,
+      "ts": 215600,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        449
+      ]
+    },
+    {
+      "id": 449,
+      "ptr": 2505182943040,
+      "size": 256,
+      "ts": 217500,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        450
+      ]
+    },
+    {
+      "id": 450,
+      "ptr": 2505182952704,
+      "size": 128,
+      "ts": 226700,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        451
+      ]
+    },
+    {
+      "id": 451,
+      "ptr": 2505182939232,
+      "size": 256,
+      "ts": 229400,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        452
+      ]
+    },
+    {
+      "id": 452,
+      "ptr": 2505182953568,
+      "size": 128,
+      "ts": 231500,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        453
+      ]
+    },
+    {
+      "id": 453,
+      "ptr": 2505182944400,
+      "size": 256,
+      "ts": 233500,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        454
+      ]
+    },
+    {
+      "id": 454,
+      "ptr": 2505182949968,
+      "size": 128,
+      "ts": 235400,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        455
+      ]
+    },
+    {
+      "id": 455,
+      "ptr": 2505182943856,
+      "size": 256,
+      "ts": 237100,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        456
+      ]
+    },
+    {
+      "id": 456,
+      "ptr": 2505182948528,
+      "size": 128,
+      "ts": 238700,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        457
+      ]
+    },
+    {
+      "id": 457,
+      "ptr": 2505182942496,
+      "size": 256,
+      "ts": 240400,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        458
+      ]
+    },
+    {
+      "id": 458,
+      "ptr": 2505182948240,
+      "size": 128,
+      "ts": 242200,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        459
+      ]
+    },
+    {
+      "id": 459,
+      "ptr": 2505182939504,
+      "size": 256,
+      "ts": 243800,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        460
+      ]
+    },
+    {
+      "id": 460,
+      "ptr": 2505182953280,
+      "size": 128,
+      "ts": 245600,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        461
+      ]
+    },
+    {
+      "id": 461,
+      "ptr": 2505182943312,
+      "size": 256,
+      "ts": 247600,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        462
+      ]
+    },
+    {
+      "id": 462,
+      "ptr": 2505182947088,
+      "size": 128,
+      "ts": 249300,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        463
+      ]
+    },
+    {
+      "id": 463,
+      "ptr": 2505182940048,
+      "size": 256,
+      "ts": 251200,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        464
+      ]
+    },
+    {
+      "id": 464,
+      "ptr": 2505182948384,
+      "size": 128,
+      "ts": 252800,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        465
+      ]
+    },
+    {
+      "id": 465,
+      "ptr": 2505182936784,
+      "size": 256,
+      "ts": 254400,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        466
+      ]
+    },
+    {
+      "id": 466,
+      "ptr": 2505182949392,
+      "size": 128,
+      "ts": 256100,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        467
+      ]
+    },
+    {
+      "id": 467,
+      "ptr": 2505182938416,
+      "size": 256,
+      "ts": 257800,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        468
+      ]
+    },
+    {
+      "id": 468,
+      "ptr": 2505182948816,
+      "size": 128,
+      "ts": 259200,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        469
+      ]
+    },
+    {
+      "id": 469,
+      "ptr": 2505182943584,
+      "size": 256,
+      "ts": 260700,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        470
+      ]
+    },
+    {
+      "id": 470,
+      "ptr": 2505182947520,
+      "size": 128,
+      "ts": 262300,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        471
+      ]
+    },
+    {
+      "id": 471,
+      "ptr": 2505182937328,
+      "size": 256,
+      "ts": 263900,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        472
+      ]
+    },
+    {
+      "id": 472,
+      "ptr": 2505182951552,
+      "size": 128,
+      "ts": 265500,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        473
+      ]
+    },
+    {
+      "id": 473,
+      "ptr": 2505182938688,
+      "size": 256,
+      "ts": 267200,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        474
+      ]
+    },
+    {
+      "id": 474,
+      "ptr": 2505182950112,
+      "size": 128,
+      "ts": 268700,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        475
+      ]
+    },
+    {
+      "id": 475,
+      "ptr": 2505182940320,
+      "size": 256,
+      "ts": 270400,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        476
+      ]
+    },
+    {
+      "id": 476,
+      "ptr": 2505182947376,
+      "size": 128,
+      "ts": 272000,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        477
+      ]
+    },
+    {
+      "id": 477,
+      "ptr": 2505182941952,
+      "size": 256,
+      "ts": 273700,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        478
+      ]
+    },
+    {
+      "id": 478,
+      "ptr": 2505182951264,
+      "size": 128,
+      "ts": 275100,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        479
+      ]
+    },
+    {
+      "id": 479,
+      "ptr": 2505182940592,
+      "size": 256,
+      "ts": 276500,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        480
+      ]
+    },
+    {
+      "id": 480,
+      "ptr": 2505182951840,
+      "size": 128,
+      "ts": 277800,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        481
+      ]
+    },
+    {
+      "id": 481,
+      "ptr": 2505182940864,
+      "size": 256,
+      "ts": 279200,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        482
+      ]
+    },
+    {
+      "id": 482,
+      "ptr": 2505182947664,
+      "size": 128,
+      "ts": 280900,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        483
+      ]
+    },
+    {
+      "id": 483,
+      "ptr": 2505182941408,
+      "size": 256,
+      "ts": 284900,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        484
+      ]
+    },
+    {
+      "id": 484,
+      "ptr": 2505182951408,
+      "size": 128,
+      "ts": 286800,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        485
+      ]
+    },
+    {
+      "id": 485,
+      "ptr": 2505182941680,
+      "size": 256,
+      "ts": 290700,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        486
+      ]
+    },
+    {
+      "id": 486,
+      "ptr": 2505182949680,
+      "size": 128,
+      "ts": 292200,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        487
+      ]
+    },
+    {
+      "id": 487,
+      "ptr": 2505182942224,
+      "size": 256,
+      "ts": 293700,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        488
+      ]
+    },
+    {
+      "id": 488,
+      "ptr": 2505182947808,
+      "size": 128,
+      "ts": 295500,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        489
+      ]
+    },
+    {
+      "id": 489,
+      "ptr": 2505182960576,
+      "size": 256,
+      "ts": 305400,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        490
+      ]
+    },
+    {
+      "id": 490,
+      "ptr": 2505182954720,
+      "size": 128,
+      "ts": 307200,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        491
+      ]
+    },
+    {
+      "id": 491,
+      "ptr": 2505182961664,
+      "size": 256,
+      "ts": 309100,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        492
+      ]
+    },
+    {
+      "id": 492,
+      "ptr": 2505182947952,
+      "size": 128,
+      "ts": 310700,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        493
+      ]
+    },
+    {
+      "id": 493,
+      "ptr": 2505182962208,
+      "size": 256,
+      "ts": 312300,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        494
+      ]
+    },
+    {
+      "id": 494,
+      "ptr": 2505182949536,
+      "size": 128,
+      "ts": 314100,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        495
+      ]
+    },
+    {
+      "id": 495,
+      "ptr": 2505182958944,
+      "size": 256,
+      "ts": 315600,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        496
+      ]
+    },
+    {
+      "id": 496,
+      "ptr": 2505182950256,
+      "size": 128,
+      "ts": 317100,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        497
+      ]
+    },
+    {
+      "id": 497,
+      "ptr": 2505182957856,
+      "size": 256,
+      "ts": 318700,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        498
+      ]
+    },
+    {
+      "id": 498,
+      "ptr": 2505182952560,
+      "size": 128,
+      "ts": 320100,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        499
+      ]
+    },
+    {
+      "id": 499,
+      "ptr": 2505182958128,
+      "size": 256,
+      "ts": 321800,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        500
+      ]
+    },
+    {
+      "id": 500,
+      "ptr": 2505182948672,
+      "size": 128,
+      "ts": 323400,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        501
+      ]
+    },
+    {
+      "id": 501,
+      "ptr": 2505182959488,
+      "size": 256,
+      "ts": 325100,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        502
+      ]
+    },
+    {
+      "id": 502,
+      "ptr": 2505182949248,
+      "size": 128,
+      "ts": 326700,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        503
+      ]
+    },
+    {
+      "id": 503,
+      "ptr": 2505182955680,
+      "size": 256,
+      "ts": 328200,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": [
+        504
+      ]
+    },
+    {
+      "id": 504,
+      "ptr": 2505182951696,
+      "size": 128,
+      "ts": 329700,
+      "symbol": "0x7ff74ba66230",
+      "live": true,
+      "state": "healthy",
+      "edges": []
+    }
+  ],
+  "update": [],
+  "remove": []
+}
