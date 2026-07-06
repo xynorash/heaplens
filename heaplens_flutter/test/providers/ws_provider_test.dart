@@ -1,5 +1,6 @@
 import 'dart:async';
 
+import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:heaplens_flutter/models/graph_diff.dart';
 import 'package:heaplens_flutter/providers/ws_provider.dart';
@@ -276,5 +277,39 @@ void main() {
       // see before any connection attempt updates it.
       expect(ConnectionStatus.values, contains(ConnectionStatus.disconnected));
     });
+  });
+
+  group('graphMessageProvider (real, unoverridden)', () {
+    test(
+      'initializing the real provider does not throw '
+      '"modify other providers during initialization"',
+      () async {
+        // Regression test for a bug only caught by a live run against the
+        // real daemon: GraphMessageConnection.start() used to be called
+        // synchronously inside graphMessageProvider's own build function,
+        // and its first action is to write ConnectionStatus.connecting into
+        // connectionStatusProvider — a second provider — before this
+        // provider's build had returned. Riverpod asserts against exactly
+        // this ("Providers are not allowed to modify other providers during
+        // their initialization"). Every other test in this file/suite
+        // overrides graphMessageProvider with a fake stream, so none of them
+        // exercise the real provider's build function or would have caught
+        // this. Here we deliberately do NOT override it, forcing the real
+        // connector to run (against a real-but-almost-certainly-unreachable
+        // local port so the test doesn't depend on a live daemon).
+        final container = ProviderContainer();
+        addTearDown(container.dispose);
+
+        // Merely reading the provider triggers its build function. The
+        // fix defers connection.start() to a microtask, so this read must
+        // not throw synchronously.
+        expect(() => container.read(graphMessageProvider), returnsNormally);
+
+        // Let the deferred microtask (and the resulting real connection
+        // attempt, which will fail since nothing is listening) run without
+        // throwing back into the test.
+        await Future<void>.delayed(const Duration(milliseconds: 50));
+      },
+    );
   });
 }

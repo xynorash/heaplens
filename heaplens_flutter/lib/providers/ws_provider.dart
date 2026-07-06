@@ -179,7 +179,16 @@ final graphMessageProvider = StreamProvider<GraphMessage>((ref) {
     onMessage: controller.add,
     onError: controller.addError,
   );
-  connection.start();
+  // Deferred to a microtask: `connection.start()` synchronously calls
+  // `onStatus` (writing to `connectionStatusProvider`) before this provider's
+  // own build function would otherwise have returned. Riverpod forbids a
+  // provider modifying another provider's state while it is still building
+  // ("Providers are not allowed to modify other providers during their
+  // initialization") and throws in debug mode if this happens — this only
+  // surfaces with the real connector (every existing test overrides
+  // `graphMessageProvider` with a fake stream, bypassing this code path
+  // entirely), so it was only caught by a live run against the real daemon.
+  Future.microtask(connection.start);
 
   ref.onDispose(() {
     connection.dispose();
