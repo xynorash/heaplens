@@ -6,15 +6,7 @@ import '../models/node.dart';
 import '../providers/graph_provider.dart';
 import '../providers/selection_provider.dart';
 import '../simulation/force_layout.dart';
-
-/// Fill colors by [NodeStateDto]. `freed` additionally has its alpha driven
-/// by the corresponding [SimNode.fade] at paint time (see [GraphPainter]).
-const Map<NodeStateDto, Color> kNodeStateColors = {
-  NodeStateDto.healthy: Color(0xFF2DD4BF), // teal
-  NodeStateDto.orphan: Color(0xFFFF7F50), // coral
-  NodeStateDto.hot: Color(0xFFFFC107), // amber
-  NodeStateDto.freed: Color(0xFF9E9E9E), // gray
-};
+import 'node_colors.dart';
 
 /// Renders the live memory-ownership graph: [ForceLayout.simNodes] positions
 /// cross-referenced with [NodeDto]s (state, edges) from the graph provider's
@@ -174,7 +166,7 @@ class GraphPainter extends CustomPainter {
       if (sim == null) continue;
 
       final center = Offset(sim.position.x, sim.position.y);
-      final baseColor = kNodeStateColors[node.state]!;
+      final baseColor = colorForState(node.state);
       final alpha = node.state == NodeStateDto.freed ? sim.fade : 1.0;
 
       final fillPaint = Paint()
