@@ -96,6 +96,7 @@ async fn main() -> anyhow::Result<()> {
                     warned_sites.clear();
                     // Anomaly sweep — returns ids of nodes whose state changed.
                     let max_ts = graph.max_ts_seen;
+                    storm_tracker.evict_idle(max_ts, &config);
                     let changed = sweep(graph.nodes_mut(), max_ts, &config);
                     for id in changed {
                         graph.mark_updated(id);

@@ -29,7 +29,7 @@ fn phi_inference_finds_owner_by_stack_overlap() {
     // Find child node (ptr 0x2000)
     let child = add.iter().find(|n| n.ptr == 0x2000).unwrap();
     let owner = add.iter().find(|n| n.ptr == 0x1000).unwrap();
-    assert_eq!(child.edges.contains(&owner.id), false); // edges_out are on the owner
+    assert!(!child.edges.contains(&owner.id)); // edges_out are on the owner
     // The owner's NodeDto edges should contain child's id
     let owner_dto = add.iter().find(|n| n.ptr == 0x1000).unwrap();
     assert!(owner_dto.edges.contains(&child.id));

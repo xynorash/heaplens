@@ -8,10 +8,16 @@ use crate::graph::Node;
 /// Run one anomaly sweep over all live nodes. Returns the ids of nodes whose
 /// state changed this pass.
 ///
-/// Evaluation order per node (Q4 invariant):
-///   1. Orphan — checked first; if matched, node is tagged and the hot check
-///      is skipped for this node.
+/// Every live node is re-evaluated against the full predicate chain each
+/// sweep (Q4 invariant):
+///   1. Orphan — checked first; wins if matched.
 ///   2. Hot — only evaluated when Orphan did not match.
+///   3. Otherwise — Healthy. This is the reset path: a node whose Hot
+///      predicate no longer holds (e.g. its cluster shrank back under
+///      threshold) returns to Healthy on the next sweep. Orphan is
+///      effectively sticky not because state is frozen, but because its
+///      predicate (`owner.is_none() && had_owner_once`, age monotonically
+///      increasing) cannot become false once true.
 ///
 /// Storm detection is handled separately via [`StormTracker::record`] and
 /// does not set `NodeState`.
@@ -19,29 +25,27 @@ pub fn sweep(nodes: &mut HashMap<u64, Node>, max_ts_seen: u64, config: &Config) 
     let mut changed: Vec<u64> = Vec::new();
 
     for node in nodes.values_mut() {
-        // Orphan check (must come first per Q4).
-        if node.live
-            && node.owner.is_none()
-            && node.had_owner_once
-            && max_ts_seen.saturating_sub(node.ts) > config.tau_ms * 1_000_000
-        {
-            if node.state != NodeState::Orphan {
-                node.state = NodeState::Orphan;
-                changed.push(node.id);
-            }
-            // Q4: orphan wins — skip hot check
+        if !node.live {
             continue;
         }
 
-        // Hot-cluster check (only reached when node is not Orphan this pass).
-        if node.live && node.edges_out.len() > config.hot_cluster_threshold
-            && node.state != NodeState::Hot
-        {
-            node.state = NodeState::Hot;
+        let is_orphan = node.owner.is_none()
+            && node.had_owner_once
+            && max_ts_seen.saturating_sub(node.ts) > config.tau_ms * 1_000_000;
+        let is_hot = node.edges_out.len() > config.hot_cluster_threshold;
+
+        let new_state = if is_orphan {
+            NodeState::Orphan
+        } else if is_hot {
+            NodeState::Hot
+        } else {
+            NodeState::Healthy
+        };
+
+        if node.state != new_state {
+            node.state = new_state;
             changed.push(node.id);
         }
-
-        // TODO: reset state to Healthy when conditions no longer hold (not yet implemented — spec is silent on reset)
     }
 
     changed
@@ -86,5 +90,23 @@ impl StormTracker {
         }
         deque.push_back(ts);
         deque.len() as u64 > config.storm_rate_threshold
+    }
+
+    /// Evict sites whose entries have all fallen outside the storm window
+    /// relative to `max_ts_seen`. Call once per Tick so the site map does not
+    /// grow unbounded with every distinct allocation site ever seen — sites
+    /// that stop allocating are pruned instead of retained forever.
+    pub fn evict_idle(&mut self, max_ts_seen: u64, config: &Config) {
+        let window_ns = config.storm_window_ms * 1_000_000;
+        self.sites.retain(|_, deque| {
+            while let Some(&front) = deque.front() {
+                if max_ts_seen.saturating_sub(front) > window_ns {
+                    deque.pop_front();
+                } else {
+                    break;
+                }
+            }
+            !deque.is_empty()
+        });
     }
 }

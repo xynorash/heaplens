@@ -115,6 +115,27 @@ fn orphan_wins_over_hot() {
     assert_eq!(nodes[&4].state, NodeState::Orphan);
 }
 
+/// A Hot node whose cluster shrinks back under threshold must return to
+/// Healthy on the next sweep — the reset path is the `else` branch, not a
+/// special case.
+#[test]
+fn hot_resets_to_healthy_when_cluster_shrinks() {
+    let config = test_config();
+    let node = make_node(5, 0, true, false, false, config.hot_cluster_threshold + 1);
+    let mut nodes = single_node_map(node);
+
+    // First sweep: tag Hot.
+    let changed = sweep(&mut nodes, 0, &config);
+    assert_eq!(changed, vec![5]);
+    assert_eq!(nodes[&5].state, NodeState::Hot);
+
+    // Cluster shrinks back under threshold.
+    nodes.get_mut(&5).unwrap().edges_out = vec![0u64; config.hot_cluster_threshold];
+    let changed = sweep(&mut nodes, 0, &config);
+    assert_eq!(changed, vec![5]);
+    assert_eq!(nodes[&5].state, NodeState::Healthy);
+}
+
 /// Recording storm_rate_threshold + 1 allocs within the window triggers storm detection.
 #[test]
 fn storm_tracker_detects_storm() {
@@ -157,5 +178,31 @@ fn storm_tracker_evicts_old() {
     assert!(
         !result,
         "after eviction only one entry remains; should not exceed threshold"
+    );
+}
+
+/// A site that stops allocating must be pruned from the map entirely once
+/// its entries fall outside the storm window — otherwise the map grows
+/// unbounded with every distinct call site ever seen over the daemon's
+/// lifetime.
+#[test]
+fn storm_tracker_evict_idle_prunes_stale_sites() {
+    let config = test_config();
+    let window_ns = config.storm_window_ms * 1_000_000;
+    let mut tracker = StormTracker::new();
+
+    tracker.record(0xAAAA, 0, &config);
+    tracker.record(0xBBBB, 0, &config);
+    assert_eq!(tracker.sites.len(), 2);
+
+    // Advance max_ts_seen well past the window without recording anything
+    // new for either site.
+    let max_ts_seen = window_ns + 1_000_001;
+    tracker.evict_idle(max_ts_seen, &config);
+
+    assert!(
+        tracker.sites.is_empty(),
+        "idle sites should be pruned from the map, got {} remaining",
+        tracker.sites.len()
     );
 }
