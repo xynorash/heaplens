@@ -80,6 +80,52 @@ class HeapLensApp extends StatelessWidget {
 /// This is intentional and load-bearing; do not remove the `ref.read
 /// (graphProvider)` call in [initState] without re-checking this ordering
 /// argument still holds.
+///
+/// ### Known residual risk: this guarantee is re-established only in
+/// [initState], not on every rebuild
+///
+/// The ordering guarantee above holds at mount time, but it is not
+/// re-verified afterwards, and there are (at least) two known ways for it to
+/// silently stop holding for a *running* app:
+///
+/// 1. **`ref.invalidate(graphProvider)`** called from anywhere else in the
+///    app after mount. Invalidating re-runs `GraphNotifier.build()`, which
+///    re-registers its `ref.listen(graphMessageProvider, ...)` — and a
+///    freshly (re-)registered listener goes to the *end* of the listener
+///    list, after this orchestrator's already-registered listener. The next
+///    message would then have this orchestrator's listener fire first, i.e.
+///    with `graph_provider.dart` not yet updated for that message.
+/// 2. **Hot reload (`debugReassemble()`), dev-only.** On hot reload, Riverpod
+///    compares a source-hash of each provider's creation function; if
+///    `GraphNotifier.build()`'s source changed (likely, since
+///    `graph_provider.dart` is an actively-evolving file), Riverpod calls
+///    `invalidateSelf()` on it as part of reassembly. That has the exact
+///    same re-registration effect as case 1 above — `GraphNotifier`'s
+///    listener moves to the end of the list, after this orchestrator's.
+///    Critically, [initState] does **not** re-run on hot reload (only
+///    `build()` does), so the fix this class relies on to establish the
+///    ordering in the first place never gets a chance to re-run and restore
+///    it.
+///
+/// In both cases the observable effect is limited to a single message: a
+/// `GraphDiff`'s `add` node's owner lookup (`ref.read(graphProvider.notifier)
+/// .nodes`) would see the pre-diff-application state instead of the
+/// post-diff one, so that one new node would spawn positioned near the
+/// canvas center instead of near its real owner. It self-corrects on the
+/// very next message (registration order doesn't change again until another
+/// invalidation/reload happens), it cannot occur in release builds (hot
+/// reload does not exist there), and `ref.invalidate(graphProvider)` is not
+/// currently called anywhere in this codebase — so this is a known,
+/// accepted, cosmetic, dev-only limitation, not a production bug.
+///
+/// A more robust design exists that would remove this dependency on
+/// listener-registration order entirely — e.g. having [_handleMessage] do
+/// owner lookups against a locally-merged view of the node map (merging
+/// `currentNodes` with the diff's own `add`/`update` entries before use)
+/// instead of relying on `graph_provider.dart` having already applied the
+/// message. That refactor is intentionally out of scope here; this comment
+/// exists so a future maintainer who hits the symptom above doesn't have to
+/// re-derive the cause from Riverpod's framework source.
 class _GraphOrchestrator extends ConsumerStatefulWidget {
   const _GraphOrchestrator({required this.child});
 

@@ -13,6 +13,7 @@ import 'package:heaplens_flutter/main.dart';
 import 'package:heaplens_flutter/models/graph_diff.dart';
 import 'package:heaplens_flutter/models/node.dart';
 import 'package:heaplens_flutter/providers/force_layout_provider.dart';
+import 'package:heaplens_flutter/providers/paused_provider.dart';
 import 'package:heaplens_flutter/providers/view_mode_provider.dart';
 import 'package:heaplens_flutter/providers/ws_provider.dart';
 import 'package:heaplens_flutter/widgets/graph_canvas.dart';
@@ -117,6 +118,57 @@ void main() {
     // Unmount so `_GraphOrchestratorState.dispose()` cancels its physics
     // `Timer.periodic` — otherwise flutter_test's fake-async zone flags it
     // as a leaked pending timer at test teardown.
+    await tester.pumpWidget(const SizedBox());
+  });
+
+  testWidgets(
+      'while paused, an incoming GraphDiff add is not applied to the shared '
+      'ForceLayout', (tester) async {
+    final controller = StreamController<GraphMessage>();
+    addTearDown(() => controller.close());
+
+    late ProviderContainer container;
+
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          graphMessageProvider.overrideWith((ref) => controller.stream),
+        ],
+        child: Consumer(
+          builder: (context, ref, _) {
+            container = ProviderScope.containerOf(context);
+            return const HeapLensApp();
+          },
+        ),
+      ),
+    );
+    await tester.pump();
+
+    // Establish a baseline node before pausing, so we can tell "nothing new
+    // arrived" apart from "nothing has ever arrived".
+    controller.add(GraphSnapshot(ts: 1, nodes: [_node(id: 1)]));
+    await tester.pump();
+    await tester.pump();
+
+    final layout = container.read(forceLayoutProvider);
+    expect(layout.simNodes.keys.toSet(), {1});
+
+    // Pause, then push a diff that adds a new node.
+    container.read(pausedProvider.notifier).state = true;
+    controller.add(
+      GraphDiff(ts: 2, add: [_node(id: 2)], update: [], remove: []),
+    );
+    await tester.pump();
+    await tester.pump();
+
+    // The pause gate in `_GraphOrchestratorState._handleMessage` should have
+    // dropped the message before it ever reached `ForceLayout`.
+    expect(layout.simNodes.keys.toSet(), {1});
+    expect(layout.simNodes.containsKey(2), isFalse);
+    expect(tester.takeException(), isNull);
+
+    // Unmount so `_GraphOrchestratorState.dispose()` cancels its physics
+    // `Timer.periodic` (see note in the earlier test).
     await tester.pumpWidget(const SizedBox());
   });
 
