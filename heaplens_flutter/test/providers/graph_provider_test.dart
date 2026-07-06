@@ -158,6 +158,35 @@ void main() {
       expect(notifier.nodes[1]!.state, NodeStateDto.healthy);
     });
 
+    test('returned nodes map is immutable — mutations throw UnsupportedError', () {
+      final notifier = container.read(graphProvider.notifier);
+      notifier.applyDiff(
+        GraphDiff(ts: 1, add: [_node(id: 1)], update: [], remove: []),
+      );
+      final nodesView = notifier.nodes;
+
+      // Attempting to mutate via assignment throws.
+      expect(
+        () => nodesView[999] = _node(id: 999),
+        throwsUnsupportedError,
+      );
+
+      // Attempting to clear throws.
+      expect(
+        () => nodesView.clear(),
+        throwsUnsupportedError,
+      );
+
+      // Attempting to remove throws.
+      expect(
+        () => nodesView.remove(1),
+        throwsUnsupportedError,
+      );
+
+      // The internal state is unchanged.
+      expect(notifier.nodes.keys.toSet(), {1});
+    });
+
     group('derived getters', () {
       test('orphanCount, liveNodeCount, totalLiveBytes computed on demand', () {
         final notifier = container.read(graphProvider.notifier);

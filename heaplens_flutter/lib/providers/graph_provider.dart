@@ -1,3 +1,5 @@
+import 'dart:collection';
+
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../models/graph_diff.dart';
@@ -37,7 +39,13 @@ class GraphNotifier extends Notifier<int> {
   /// consumers (e.g. the graph canvas) that `ref.watch(graphProvider)` for
   /// the revision and then pull the current map via
   /// `ref.read(graphProvider.notifier).nodes`.
-  Map<int, NodeDto> get nodes => _nodes;
+  ///
+  /// **Important:** The returned map is mutated in place internally on each
+  /// [applyDiff] call. Do not retain a reference to this map across a revision
+  /// change and expect it to reflect old state. Always read the map fresh via
+  /// `notifier.nodes` after a `ref.watch(graphProvider)` revision change;
+  /// don't cache the reference.
+  UnmodifiableMapView<int, NodeDto> get nodes => UnmodifiableMapView(_nodes);
 
   /// Applies one incoming [GraphMessage] to the node map and bumps
   /// [revision] by exactly 1 — regardless of how many nodes the message
