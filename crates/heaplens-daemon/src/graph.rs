@@ -18,6 +18,8 @@ pub struct Node {
     pub edges_out: Vec<u64>,
     /// True once an owner was assigned and then freed — used by M4 orphan detection.
     pub had_owner_once: bool,
+    /// Current anomaly classification; updated by anomaly::sweep.
+    pub state: NodeState,
 }
 
 pub struct OwnershipGraph {
@@ -30,8 +32,8 @@ pub struct OwnershipGraph {
     added: Vec<u64>,
     updated: HashSet<u64>,
     removed: Vec<u64>,
-    /// Monotonic timestamp of the last processed event (used as Diff.ts).
-    last_ts: u64,
+    /// Rolling max of ev.ts_nanos across all received events. Used as Diff.ts.
+    pub max_ts_seen: u64,
 }
 
 impl Default for OwnershipGraph {
@@ -49,12 +51,12 @@ impl OwnershipGraph {
             added: Vec::new(),
             updated: HashSet::new(),
             removed: Vec::new(),
-            last_ts: 0,
+            max_ts_seen: 0,
         }
     }
 
     pub fn on_alloc(&mut self, ev: &AllocEvent) {
-        self.last_ts = self.last_ts.max(ev.ts_nanos);
+        self.max_ts_seen = self.max_ts_seen.max(ev.ts_nanos);
         let id = self.next_id;
         self.next_id += 1;
 
@@ -71,6 +73,7 @@ impl OwnershipGraph {
             owner: owner_id,
             edges_out: Vec::new(),
             had_owner_once: owner_id.is_some(),
+            state: NodeState::Healthy,
         };
 
         // Register as a child of the owner.
@@ -142,7 +145,7 @@ impl OwnershipGraph {
                     0,
                     new_size,
                     0,
-                    self.last_ts,
+                    self.max_ts_seen,
                     [0u64; 8],
                     0,
                 );
@@ -152,7 +155,7 @@ impl OwnershipGraph {
     }
 
     pub fn drain_diff(&mut self, resolver: &Resolver) -> GraphMessage {
-        let ts = self.last_ts;
+        let ts = self.max_ts_seen;
 
         let added_set: HashSet<u64> = self.added.iter().copied().collect();
         let removed_set: HashSet<u64> = self.removed.iter().copied().collect();
@@ -204,6 +207,22 @@ impl OwnershipGraph {
         self.by_ptr.get(&ptr).and_then(|&id| self.nodes.get(&id))
     }
 
+    pub fn snapshot(&self, resolver: &Resolver) -> GraphMessage {
+        let nodes: Vec<NodeDto> = self.nodes.values()
+            .filter(|n| n.live)
+            .map(|n| Self::node_to_dto(n, resolver))
+            .collect();
+        GraphMessage::Snapshot { ts: self.max_ts_seen, nodes }
+    }
+
+    pub fn mark_updated(&mut self, id: u64) {
+        self.updated.insert(id);
+    }
+
+    pub fn nodes_mut(&mut self) -> &mut std::collections::HashMap<u64, Node> {
+        &mut self.nodes
+    }
+
     fn node_to_dto(n: &Node, resolver: &Resolver) -> NodeDto {
         let symbol = if n.stack_len > 0 {
             resolver.name_for(n.stack[0])
@@ -217,7 +236,7 @@ impl OwnershipGraph {
             ts: n.ts,
             symbol,
             live: n.live,
-            state: NodeState::Healthy, // M3: no anomaly detection
+            state: n.state.clone(),
             edges: n.edges_out.clone(),
         }
     }
