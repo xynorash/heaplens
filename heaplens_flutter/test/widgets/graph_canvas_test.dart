@@ -132,4 +132,61 @@ void main() {
 
     expect(container.read(selectedNodeIdProvider), 42);
   });
+
+  testWidgets(
+      'tap at a SimNode with no NodeDto backing does not select it',
+      (tester) async {
+    final controller = StreamController<GraphMessage>();
+    addTearDown(() => controller.close());
+
+    final layout = ForceLayout(centerX: 200, centerY: 200, random: Random(3));
+    // Create a node and add it to the layout so it exists in simNodes.
+    final ghostNode = _node(id: 99, state: NodeStateDto.healthy);
+    layout.addNode(ghostNode, {99: ghostNode});
+    // Pin the node's position/radius so we know exactly where to tap.
+    layout.simNodes[99]!.position.setValues(250, 250);
+    layout.simNodes[99]!.radius = 20;
+
+    late ProviderContainer container;
+
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          graphMessageProvider.overrideWith((ref) => controller.stream),
+        ],
+        child: Consumer(
+          builder: (context, ref, _) {
+            container = ProviderScope.containerOf(context);
+            return MaterialApp(
+              home: Scaffold(
+                body: SizedBox(
+                  width: 400,
+                  height: 400,
+                  child: GraphCanvas(layout: layout),
+                ),
+              ),
+            );
+          },
+        ),
+      ),
+    );
+
+    // Intentionally do NOT add ghostNode to the node map via applyDiff.
+    // This simulates the transient state where a SimNode exists but its
+    // NodeDto has been removed (e.g., mid-fade-out after removal).
+    container
+        .read(graphProvider.notifier)
+        .applyDiff(GraphSnapshot(ts: 1, nodes: []));
+    await tester.pump();
+
+    expect(container.read(selectedNodeIdProvider), isNull);
+
+    // Try to tap on the ghost node. The tap handler should find it in
+    // simNodes but must NOT select it because it has no NodeDto backing.
+    await tester.tapAt(const Offset(250, 250));
+    await tester.pump();
+
+    // selectedNodeIdProvider should remain null/unchanged.
+    expect(container.read(selectedNodeIdProvider), isNull);
+  });
 }

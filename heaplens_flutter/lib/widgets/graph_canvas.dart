@@ -74,8 +74,15 @@ class _GraphCanvasState extends ConsumerState<GraphCanvas>
       }
     }
 
+    // Only select the node if it exists in the current node map.
+    // A SimNode can transiently exist without a matching NodeDto during
+    // diff application (e.g., mid-fade-out after removal). Avoid selecting
+    // a ghost id that has no NodeDto backing.
     if (bestId != null) {
-      ref.read(selectedNodeIdProvider.notifier).state = bestId;
+      final nodes = ref.read(graphProvider.notifier).nodes;
+      if (nodes.containsKey(bestId)) {
+        ref.read(selectedNodeIdProvider.notifier).state = bestId;
+      }
     }
   }
 
