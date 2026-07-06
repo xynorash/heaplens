@@ -44,6 +44,16 @@ const double kFadeDurationSeconds = 1.0;
 /// threshold, not at or below it.
 const int kAggregationThreshold = 500;
 
+/// ENF9 hysteresis: once aggregated, [ForceLayout] does not fall back to
+/// individual mode until [ForceLayout.liveNodeCount] drops *below* this
+/// (lower) threshold. This creates a dead zone between
+/// [kAggregationExitThreshold] and [kAggregationThreshold] where neither
+/// transition fires, so live-count churn oscillating near the boundary
+/// (e.g. 498, 501, 499, 502...) doesn't repeatedly force a full
+/// [ForceLayout._rebuildFromRaw] reset in each direction. Must stay
+/// strictly below [kAggregationThreshold].
+const int kAggregationExitThreshold = 450;
+
 /// Half-width (px) of the random jitter box used when spawning a node: near
 /// its owner (so it doesn't land exactly on top of it) or near canvas
 /// center when there is no positioned owner.
@@ -262,31 +272,61 @@ class ForceLayout {
   // ---------------------------------------------------------------------
 
   /// *** ENF9 switch point ***
-  /// Compares [liveNodeCount] against [kAggregationThreshold] and flips
-  /// [_aggregated] when it crosses the boundary, rebuilding [simNodes] from
-  /// [_rawNodes] under the new mode. Strictly-greater-than: 500 live nodes
-  /// stays in individual mode, 501 switches to aggregated. Any future
-  /// maintainer touching this threshold or its comparison operator changes
-  /// real on-screen behavior (500 individually-rendered nodes vs. one dot
-  /// per symbol) — read ENF9 in the build spec before changing it.
+  /// Compares [liveNodeCount] against [kAggregationThreshold] /
+  /// [kAggregationExitThreshold] (hysteresis) and flips [_aggregated] when
+  /// it crosses the relevant boundary, rebuilding [simNodes] from
+  /// [_rawNodes] under the new mode. Entering aggregated mode is still
+  /// strictly-greater-than [kAggregationThreshold] (500 live nodes stays in
+  /// individual mode, 501 switches to aggregated) — that entry threshold has
+  /// not moved. Falling back to individual mode additionally requires
+  /// dropping *below* [kAggregationExitThreshold] (450), not merely back to
+  /// 500, so churn inside the [kAggregationExitThreshold]..[kAggregationThreshold]
+  /// dead zone doesn't thrash between modes. Any future maintainer touching
+  /// either threshold or comparison operator changes real on-screen behavior
+  /// (individually-rendered nodes vs. one dot per symbol) — read ENF9 in the
+  /// build spec before changing it.
   void _syncAggregation() {
-    final shouldAggregate = liveNodeCount > kAggregationThreshold;
+    final count = liveNodeCount;
+    final shouldAggregate = _aggregated
+        ? count >= kAggregationExitThreshold
+        : count > kAggregationThreshold;
     if (shouldAggregate == _aggregated) return;
     _aggregated = shouldAggregate;
     _rebuildFromRaw();
   }
 
   /// Rebuilds all simulation state from [_rawNodes] under the current
-  /// [_aggregated] mode. This is a hard reset of positions/velocities/fades
-  /// for the mode being rebuilt into — an accepted trade-off since mode
-  /// switches only happen at the 500-node threshold boundary, which is
+  /// [_aggregated] mode. This is a hard reset of positions/velocities for
+  /// the mode being rebuilt into — an accepted trade-off since mode
+  /// switches only happen at the aggregation threshold boundary, which is
   /// rare relative to normal add/update/remove traffic.
+  ///
+  /// Nodes that are currently mid-fade (tracked in [_fadeRemaining]) are the
+  /// one exception: [removeNode] already deletes their raw id (or aggregate
+  /// membership) the instant fade begins, so they have no representation in
+  /// [_rawNodes] and would otherwise vanish from this rebuild instead of
+  /// completing their ~1s fade-out. Their existing [SimNode] (position,
+  /// velocity, fade progress) and remaining countdown are carried over
+  /// untouched — they don't participate in physics/membership for the new
+  /// mode, they just keep counting down via the normal [_advanceFades] path.
   void _rebuildFromRaw() {
+    final fadingSimNodes = <int, SimNode>{
+      for (final id in _fadeRemaining.keys)
+        if (simNodes.containsKey(id)) id: simNodes[id]!,
+    };
+    final fadingRemaining = Map<int, double>.from(_fadeRemaining);
+    // Avoid a freshly-assigned synthetic aggregate id colliding with a
+    // preserved fading synthetic id from the mode being left.
+    final preservedMinId = fadingSimNodes.keys.fold<int>(
+      0,
+      (min, id) => id < min ? id : min,
+    );
+
     simNodes.clear();
     _fadeRemaining.clear();
     _symbolToAggId.clear();
     _aggMembers.clear();
-    _nextSyntheticId = -1;
+    _nextSyntheticId = preservedMinId < 0 ? preservedMinId - 1 : -1;
 
     if (_aggregated) {
       for (final node in _rawNodes.values) {
@@ -302,6 +342,9 @@ class ForceLayout {
         );
       }
     }
+
+    simNodes.addAll(fadingSimNodes);
+    _fadeRemaining.addAll(fadingRemaining);
   }
 
   void _addToAggregate(NodeDto node) {

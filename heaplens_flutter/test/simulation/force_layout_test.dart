@@ -162,22 +162,103 @@ void main() {
       expect(layout.simNodes.length, equals(symbolCount));
     });
 
-    test('falls back to individual mode when count drops back at/below '
-        'threshold', () {
-      final layout = ForceLayout(random: Random(5));
-      for (var i = 0; i < kAggregationThreshold + 1; i++) {
-        final n = _node(id: i, symbol: 'sym_${i % 10}');
-        layout.addNode(n, {i: n});
-      }
-      layout.step(0.016);
-      expect(layout.isAggregated, isTrue);
+    test(
+      'does NOT fall back to individual mode merely dropping back to the '
+      'entry threshold — hysteresis dead zone',
+      () {
+        final layout = ForceLayout(random: Random(5));
+        for (var i = 0; i < kAggregationThreshold + 1; i++) {
+          final n = _node(id: i, symbol: 'sym_${i % 10}');
+          layout.addNode(n, {i: n});
+        }
+        layout.step(0.016);
+        expect(layout.isAggregated, isTrue);
 
-      layout.removeNode(kAggregationThreshold); // back down to threshold
-      layout.step(0.016);
+        layout.removeNode(kAggregationThreshold); // back down to threshold
+        layout.step(0.016);
 
-      expect(layout.liveNodeCount, equals(kAggregationThreshold));
-      expect(layout.isAggregated, isFalse);
-    });
+        // Still above kAggregationExitThreshold (450), so hysteresis keeps
+        // it aggregated instead of thrashing back to individual mode.
+        expect(layout.liveNodeCount, equals(kAggregationThreshold));
+        expect(layout.isAggregated, isTrue);
+      },
+    );
+
+    test(
+      'hysteresis: stays aggregated in the dead zone, only falls back once '
+      'below the exit threshold',
+      () {
+        final layout = ForceLayout(random: Random(5));
+        for (var i = 0; i < kAggregationThreshold + 1; i++) {
+          final n = _node(id: i, symbol: 'sym_${i % 10}');
+          layout.addNode(n, {i: n});
+        }
+        layout.step(0.016);
+        expect(layout.isAggregated, isTrue);
+
+        // Drop down to 480 (between kAggregationExitThreshold=450 and
+        // kAggregationThreshold=500): must NOT switch back to individual.
+        for (var i = kAggregationThreshold; i >= 480; i--) {
+          layout.removeNode(i);
+        }
+        layout.step(0.016);
+        expect(layout.liveNodeCount, equals(480));
+        expect(layout.isAggregated, isTrue);
+
+        // Drop further, below kAggregationExitThreshold=450: now it must
+        // fall back to individual mode.
+        for (var i = 479; i >= 440; i--) {
+          layout.removeNode(i);
+        }
+        layout.step(0.016);
+        expect(layout.liveNodeCount, equals(440));
+        expect(layout.isAggregated, isFalse);
+      },
+    );
+
+    test(
+      'a node mid-fade survives a mode-switch rebuild and still deletes '
+      'itself once its fade completes',
+      () {
+        final layout = ForceLayout(random: Random(5));
+        for (var i = 0; i < kAggregationThreshold; i++) {
+          final n = _node(id: i, symbol: 'sym_${i % 10}');
+          layout.addNode(n, {i: n});
+        }
+        layout.step(0.016);
+        expect(layout.isAggregated, isFalse);
+
+        // Start a fade on one individual-mode node, then immediately push
+        // live count past the aggregation threshold in the same tick's
+        // worth of events (fade begins, then boundary is crossed).
+        layout.removeNode(0);
+        expect(layout.simNodes.containsKey(0), isTrue);
+        expect(layout.simNodes[0]!.fade, equals(1.0));
+
+        // Live count was 500 (not > 500), then dropped to 499 by the
+        // removeNode above; add two new nodes to push it to 501, strictly
+        // above kAggregationThreshold, before the next step.
+        final extraA = _node(id: 999998, symbol: 'sym_new');
+        final extraB = _node(id: 999999, symbol: 'sym_new');
+        layout.addNode(extraA, {999998: extraA});
+        layout.addNode(extraB, {999999: extraB});
+        layout.step(0.016); // crosses into aggregated mode -> rebuild
+
+        expect(layout.isAggregated, isTrue);
+        // The fading node must have survived the mode-switch rebuild rather
+        // than being dropped instantly.
+        expect(layout.simNodes.containsKey(0), isTrue);
+        expect(layout.simNodes[0]!.fade, lessThanOrEqualTo(1.0));
+        expect(layout.simNodes[0]!.fade, greaterThan(0.0));
+
+        // Advance enough simulated time to finish the fade; it must be
+        // deleted via the normal _advanceFades path, not left dangling.
+        for (var i = 0; i < 20; i++) {
+          layout.step(0.1);
+        }
+        expect(layout.simNodes.containsKey(0), isFalse);
+      },
+    );
   });
 
   group('step physics sanity', () {
