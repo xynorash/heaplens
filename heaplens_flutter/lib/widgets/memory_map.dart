@@ -11,6 +11,9 @@ import 'node_colors.dart';
 const double _kCellSize = 28.0;
 const double _kCellSpacing = 2.0;
 
+/// Default column count when parent provides unbounded (infinite) width.
+const int _kDefaultColumnsWhenUnbounded = 20;
+
 /// Address-ordered "memory map" view: every live node gets exactly one cell,
 /// sorted by [NodeDto.ptr] ascending and laid into a grid whose column count
 /// is derived from the available width. Cell area is NOT proportional to
@@ -53,10 +56,11 @@ class MemoryMap extends ConsumerWidget {
 
     return LayoutBuilder(
       builder: (context, constraints) {
-        final columns = ((constraints.maxWidth) /
-                (_kCellSize + _kCellSpacing))
-            .floor()
-            .clamp(1, 1 << 30);
+        final columns = constraints.maxWidth.isFinite
+            ? ((constraints.maxWidth) / (_kCellSize + _kCellSpacing))
+                .floor()
+                .clamp(1, 1 << 30)
+            : _kDefaultColumnsWhenUnbounded;
 
         return GridView.builder(
           padding: const EdgeInsets.all(_kCellSpacing),
