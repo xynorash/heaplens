@@ -142,6 +142,7 @@ class GraphMessageConnection {
 
   void _scheduleReconnect() {
     if (_disposed) return;
+    _closeCurrent?.call();
     onStatus(ConnectionStatus.disconnected);
     final delay = backoff(_attempt);
     _attempt++;

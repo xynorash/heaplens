@@ -202,6 +202,51 @@ void main() {
       await controllers[2].close();
     });
 
+    test('close callback fires before scheduling reconnect', () async {
+      final firstController = StreamController<dynamic>();
+      final secondController = StreamController<dynamic>();
+      var connectorCallCount = 0;
+      final closeCallOrder = <String>[];
+
+      final connection = buildConnection(
+        connector: () {
+          connectorCallCount++;
+          closeCallOrder.add('connector_call_$connectorCallCount');
+          final stream = connectorCallCount == 1 ? firstController.stream : secondController.stream;
+          return WsFrames(
+            stream,
+            () {
+              closeCallOrder.add('close_called_$connectorCallCount');
+            },
+          );
+        },
+      );
+
+      connection.start();
+      expect(connectorCallCount, 1);
+      expect(closeCallOrder, ['connector_call_1']);
+
+      // Trigger reconnect via onDone.
+      await firstController.close();
+      await Future<void>.delayed(Duration.zero);
+      await Future<void>.delayed(Duration.zero);
+
+      // Verify the order: first connection's close should be called before
+      // the second connector is called.
+      expect(connectorCallCount, 2);
+      expect(
+        closeCallOrder,
+        [
+          'connector_call_1',
+          'close_called_1', // First connection closed
+          'connector_call_2', // Before second connection opened
+        ],
+      );
+
+      connection.dispose();
+      await secondController.close();
+    });
+
     test('dispose stops further reconnect attempts', () async {
       final controller = StreamController<dynamic>();
       var callCount = 0;
