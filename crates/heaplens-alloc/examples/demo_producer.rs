@@ -48,6 +48,11 @@ fn heartbeat(seconds: u64) {
 /// with it. Unlike `wire_producer.rs` (which allocates and frees everything
 /// within ~2 seconds, purely to exercise the wire format), this scenario is
 /// designed to still be on screen when a human checks it.
+///
+/// This is the soutenance/thesis demo scenario. Timeline maps directly to
+/// the demo script: T+0s family allocated (owner + 20 children appear);
+/// T+60s owner freed (children flip to coral/orphan — confirmed live,
+/// fix/canvas-render investigation); T+80s children freed (fade out, ~1s).
 fn main() {
     println!("demo_producer: allocating 1 owner + 20 children");
     let (owner, children) = make_family(20);
