@@ -44,6 +44,8 @@ class _DebugOverlayState extends ConsumerState<DebugOverlay> {
   int _snapshotCount = 0;
   int _diffCount = 0;
   Timer? _pollTimer;
+  Timer? _logTimer;
+  String? _lastStatsLine;
 
   @override
   void initState() {
@@ -51,11 +53,18 @@ class _DebugOverlayState extends ConsumerState<DebugOverlay> {
     _pollTimer = Timer.periodic(const Duration(milliseconds: 200), (_) {
       if (mounted) setState(() {});
     });
+    // Mirrors the overlay's on-screen text to the console every 2s so the
+    // pipeline is traceable from logs alone, not only by looking at the
+    // window — useful for automated/log-only verification passes.
+    _logTimer = Timer.periodic(const Duration(seconds: 2), (_) {
+      if (_lastStatsLine != null) debugPrint('[DebugOverlay] $_lastStatsLine');
+    });
   }
 
   @override
   void dispose() {
     _pollTimer?.cancel();
+    _logTimer?.cancel();
     super.dispose();
   }
 
@@ -98,6 +107,10 @@ class _DebugOverlayState extends ConsumerState<DebugOverlay> {
     final sincePaint = lastPaintAt == null
         ? 'never'
         : '${DateTime.now().difference(lastPaintAt).inMilliseconds}ms ago';
+
+    _lastStatsLine = 'WS=${status.name} msgs(snap=$_snapshotCount,diff=$_diffCount) '
+        'revision=$revision liveNodes=$liveNodeCount simNodes=$simNodeCount '
+        'bounds=$bounds${hasNaN ? ' NaN!' : ''} lastPaint=$sincePaint';
 
     return Positioned(
       right: 8,
