@@ -156,6 +156,7 @@ class _GraphCanvasState extends ConsumerState<GraphCanvas>
               animation: _pulseController,
               builder: (context, _) {
                 return CustomPaint(
+                  key: const Key('graphCanvasPaint'),
                   size: constraints.biggest,
                   painter: GraphPainter(
                     simNodes: widget.layout.simNodes,
@@ -204,8 +205,15 @@ class GraphPainter extends CustomPainter {
     ..strokeWidth = 1.0
     ..style = PaintingStyle.stroke;
 
+  /// Wall-clock time of the most recent [paint] call. Diagnostic-only (see
+  /// `debug_overlay.dart`, fix/canvas-render branch): lets an on-screen
+  /// overlay show whether the paint pipeline is actually being driven at
+  /// all, independent of whether anything currently visible gets drawn.
+  static DateTime? lastPaintAt;
+
   @override
   void paint(Canvas canvas, Size size) {
+    lastPaintAt = DateTime.now();
     _paintEdges(canvas);
     _paintNodes(canvas);
   }

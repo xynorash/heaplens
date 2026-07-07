@@ -282,3 +282,64 @@ Flutter/Windows toolchain and live process orchestration:
 
 Task 1 → 2 → 3 → 4 → 5 → 6 → 7 → 8 → 9 → 10. `flutter analyze` after each
 task. Stop after Task 10 (M5 complete) — do not begin Stage 6.
+
+## Post-merge addendum: blank-canvas defect and visual-gate closure
+
+**Defect report (post-M5-merge, branch `fix/canvas-render`):** after M5 was
+merged to master, direct human observation of the live app against the real
+daemon showed only the control bar/menus — no nodes on the canvas. All of
+M5's Task 10 evidence (WS captures, logs, memory growth, 77 green tests)
+was indirect and could not rule out a dead render path, so this overrode
+the merged M5 acceptance pending investigation.
+
+**Diagnosis:** a full code read of the daemon->canvas pipeline (WS
+provider, graph provider, force layout, graph canvas/painter) found no
+structural defect. To get direct, non-screenshot observability (screenshots
+remained off the table per the standing incident-driven instruction from
+M5's Task 10), a standing on-screen debug overlay was added
+(`lib/debug/debug_overlay.dart`, gated by `kShowDebugOverlay`) showing WS
+status, message counts, `graph_provider` revision, live node count,
+SimNode count + position bounds (NaN check), and `GraphPainter`'s
+last-paint timestamp — mirrored to the console every 2s for log-only
+verification. Live-traced against the real daemon: the only producer that
+existed before this (`wire_producer`) completes its entire
+allocate-then-free-everything cycle in under 2 seconds; a human checking
+the canvas after that window would correctly see it empty. A new example,
+`crates/heaplens-alloc/examples/demo_producer.rs`, was built specifically
+to give a human time to look: 1 owner + 20 children held alive for 60s,
+then the owner is freed (orphaning the children) for a further 20s, with a
+500ms heartbeat allocation throughout to keep `max_ts_seen` advancing.
+
+**Root cause: timing, not a code defect.** The live trace with
+`demo_producer` showed nodes appearing within ~1s, persisting correctly
+through the 60s hold (paint running every ~16ms, no NaN, no stall), and
+fading cleanly on removal — confirming the pipeline was never broken.
+
+**Regression test added:** every existing test (77 passing) asserted "no
+exception" or hit-test/selection behavior — none asserted the painter
+actually drew anything, so a genuinely dead render path could have passed
+the whole suite. `test/widgets/graph_canvas_test.dart` gained a test using
+`flutter_test`'s `paints` matcher (`paintsNothing` on an empty provider,
+`paints..circle()` once populated), sanity-checked by temporarily
+commenting out the `drawCircle` call and confirming the test fails.
+
+**Visual-verification gates carried from M5 into Stage 6 — status:**
+1. **Fade rendering (freed nodes)** — **CLOSED**, confirmed by direct user
+   observation during this investigation's live run.
+2. **Orphan visuals (coral + pulsing ring)** — **CLOSED**, confirmed by
+   direct user observation: children visibly flipped to coral at T+60s in
+   the `demo_producer` scenario.
+3. **Hot state (amber, >32-edge star)** — **still open.** φ ownership
+   inference produces chains, not stars, for every existing producer
+   (`wire_producer`, `demo_producer`); no producer yet constructs a
+   genuine single-owner, >32-child star. Carried forward as a Stage 6 gate
+   — needs a dedicated producer built around distinct call sites all
+   converging on one long-lived owner.
+
+**Standing artifacts (not removed, not throwaway):**
+- The debug overlay stays behind its flag permanently — it is the
+  instrument for Stage 6's benchmark sessions and the thesis demo
+  rehearsal, not a temporary diagnostic.
+- `demo_producer.rs` is the thesis/soutenance demo scenario: T+0 allocate
+  family, T+60s owner freed (orphans appear), T+80s children freed (fade
+  out). See its header comment for the mapping to the demo script.

@@ -3,6 +3,7 @@ import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import 'debug/debug_overlay.dart';
 import 'models/graph_diff.dart';
 import 'providers/force_layout_provider.dart';
 import 'providers/graph_provider.dart';
@@ -235,28 +236,33 @@ class HeapLensHome extends ConsumerWidget {
 
     return Scaffold(
       body: SafeArea(
-        child: Column(
+        child: Stack(
           children: [
-            const ControlBar(),
-            Expanded(
-              child: Row(
-                children: [
-                  Expanded(
-                    child: switch (viewMode) {
-                      ViewMode.graph => GraphCanvas(layout: layout),
-                      ViewMode.memoryMap => const MemoryMap(),
-                    },
+            Column(
+              children: [
+                const ControlBar(),
+                Expanded(
+                  child: Row(
+                    children: [
+                      Expanded(
+                        child: switch (viewMode) {
+                          ViewMode.graph => GraphCanvas(layout: layout),
+                          ViewMode.memoryMap => const MemoryMap(),
+                        },
+                      ),
+                      if (selectedId != null)
+                        Container(
+                          key: const Key('nodeDetailPanel'),
+                          width: 320,
+                          color: const Color(0xFF1A1A1A),
+                          child: const NodeDetail(),
+                        ),
+                    ],
                   ),
-                  if (selectedId != null)
-                    Container(
-                      key: const Key('nodeDetailPanel'),
-                      width: 320,
-                      color: const Color(0xFF1A1A1A),
-                      child: const NodeDetail(),
-                    ),
-                ],
-              ),
+                ),
+              ],
             ),
+            if (kShowDebugOverlay) const DebugOverlay(),
           ],
         ),
       ),
