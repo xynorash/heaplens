@@ -156,6 +156,7 @@ class _GraphCanvasState extends ConsumerState<GraphCanvas>
               animation: _pulseController,
               builder: (context, _) {
                 return CustomPaint(
+                  key: const Key('graphCanvasPaint'),
                   size: constraints.biggest,
                   painter: GraphPainter(
                     simNodes: widget.layout.simNodes,

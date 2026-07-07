@@ -328,4 +328,59 @@ void main() {
     // ...and the underlying node map is untouched by the filter.
     expect(container.read(graphProvider.notifier).nodes.length, 2);
   });
+
+  testWidgets(
+      'regression: painter actually draws circles when the provider is '
+      'populated, and draws nothing when it is empty — the test class '
+      'missing before fix/canvas-render (77 tests passed with a blank '
+      'canvas, none of them asserted anything was actually painted)',
+      (tester) async {
+    final controller = StreamController<GraphMessage>();
+    addTearDown(() => controller.close());
+
+    final layout = ForceLayout(centerX: 200, centerY: 200, random: Random(7));
+    final node = _node(id: 1, state: NodeStateDto.healthy);
+    layout.addNode(node, {1: node});
+    layout.simNodes[1]!.position.setValues(150, 150);
+    layout.simNodes[1]!.radius = 20;
+
+    late ProviderContainer container;
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          graphMessageProvider.overrideWith((ref) => controller.stream),
+        ],
+        child: Consumer(
+          builder: (context, ref, _) {
+            container = ProviderScope.containerOf(context);
+            return MaterialApp(
+              home: Scaffold(
+                body: SizedBox(
+                  width: 400,
+                  height: 400,
+                  child: GraphCanvas(layout: layout),
+                ),
+              ),
+            );
+          },
+        ),
+      ),
+    );
+
+    // Empty provider: nothing to paint. If a future change makes the
+    // painter draw a background/border regardless of data, tighten this to
+    // check circle-count specifically rather than "no draw calls at all".
+    await tester.pump();
+    expect(find.byKey(const Key('graphCanvasPaint')), paintsNothing);
+
+    // Populate: the painter must now actually issue a drawCircle call for
+    // the live node. This is the assertion class that would have caught a
+    // dead render path (revision/simNodes populated correctly upstream,
+    // but the painter never invoked, or invoked with stale/empty data).
+    container
+        .read(graphProvider.notifier)
+        .applyDiff(GraphSnapshot(ts: 1, nodes: [node]));
+    await tester.pump();
+    expect(find.byKey(const Key('graphCanvasPaint')), paints..circle());
+  });
 }
