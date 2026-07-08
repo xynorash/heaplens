@@ -4,7 +4,11 @@ use crate::event::AllocEvent;
 pub enum Frame {
     Handshake { pid: u64, name: String },
     Events(Vec<AllocEvent>),
-    Symbols(Vec<(u64, String)>),
+    /// (addr, resolved name, is_machinery) — `is_machinery` is true when the
+    /// writer classified this address as part of the shared instrumentation
+    /// chain (capture/record/allocator shims/std alloc internals) rather
+    /// than genuine caller code. See writer.rs's classification prefix set.
+    Symbols(Vec<(u64, String, bool)>),
 }
 
 /// Encode a HANDSHAKE frame.
@@ -38,19 +42,20 @@ pub fn encode_events(events: &[AllocEvent]) -> Vec<u8> {
 }
 
 /// Encode a SYMBOLS frame.
-/// Wire: [u32 length][0x02][u16 count]([u64 addr][u16 name_len][name UTF-8] × count)
-pub fn encode_symbols(symbols: &[(u64, &str)]) -> Vec<u8> {
-    let payload_body: usize = symbols.iter().map(|(_, n)| 8 + 2 + n.len()).sum();
+/// Wire: [u32 length][0x02][u16 count]([u64 addr][u16 name_len][name UTF-8][u8 is_machinery] × count)
+pub fn encode_symbols(symbols: &[(u64, &str, bool)]) -> Vec<u8> {
+    let payload_body: usize = symbols.iter().map(|(_, n, _)| 8 + 2 + n.len() + 1).sum();
     let payload_len = 1 + 2 + payload_body;
     let mut buf = Vec::with_capacity(4 + payload_len);
     buf.extend_from_slice(&u32::try_from(payload_len).expect("symbols payload exceeds u32::MAX").to_le_bytes());
     buf.push(0x02);
     buf.extend_from_slice(&u16::try_from(symbols.len()).expect("symbols count exceeds u16::MAX").to_le_bytes());
-    for (addr, name) in symbols {
+    for (addr, name, is_machinery) in symbols {
         let name_bytes = name.as_bytes();
         buf.extend_from_slice(&addr.to_le_bytes());
         buf.extend_from_slice(&u16::try_from(name_bytes.len()).expect("symbol name exceeds 65535 bytes").to_le_bytes());
         buf.extend_from_slice(name_bytes);
+        buf.push(u8::from(*is_machinery));
     }
     buf
 }
@@ -61,7 +66,7 @@ const MAX_FRAME_LEN: u32 = 8 * 1024 * 1024; // 8 MiB
 // during resync without waiting for the full body to arrive.
 //   Handshake (0x00): 1 tag + 8 pid + 2 name_len + 65535 name  = 65546
 //   Events    (0x01): 1 tag + 2 count + 65535 * AllocEvent::SIZE (≈6.6 MiB, but capped by MAX_FRAME_LEN)
-//   Symbols   (0x02): 1 tag + 2 count + 65535 * (8+2+65535) (> MAX_FRAME_LEN — no extra cap needed)
+//   Symbols   (0x02): 1 tag + 2 count + 65535 * (8+2+65535+1) (> MAX_FRAME_LEN — no extra cap needed)
 const MAX_HANDSHAKE_LEN: u32 = 1 + 8 + 2 + 65535; // 65546
 
 enum DecoderState {
@@ -219,7 +224,7 @@ impl FrameDecoder {
     }
 
     fn decode_symbols(payload: &[u8]) -> Option<Frame> {
-        // payload: [u16 count]([u64 addr][u16 name_len][name UTF-8] × count)
+        // payload: [u16 count]([u64 addr][u16 name_len][name UTF-8][u8 is_machinery] × count)
         if payload.len() < 2 {
             return None;
         }
@@ -233,12 +238,14 @@ impl FrameDecoder {
             let addr     = u64::from_le_bytes(payload[cursor..cursor + 8].try_into().unwrap());
             let name_len = u16::from_le_bytes(payload[cursor + 8..cursor + 10].try_into().unwrap()) as usize;
             cursor += 10;
-            if cursor + name_len > payload.len() {
+            if cursor + name_len + 1 > payload.len() {
                 return None;
             }
             let name = std::str::from_utf8(&payload[cursor..cursor + name_len]).ok()?.to_owned();
             cursor += name_len;
-            syms.push((addr, name));
+            let is_machinery = payload[cursor] != 0;
+            cursor += 1;
+            syms.push((addr, name, is_machinery));
         }
         Some(Frame::Symbols(syms))
     }

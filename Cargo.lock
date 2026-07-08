@@ -277,6 +277,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "heaplens-launcher"
+version = "0.1.0"
+dependencies = [
+ "windows-sys",
+]
+
+[[package]]
 name = "heaplens-protocol"
 version = "0.1.0"
 dependencies = [

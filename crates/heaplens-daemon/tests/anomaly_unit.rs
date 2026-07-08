@@ -36,7 +36,7 @@ fn make_node(
         size: 64,
         ts,
         live,
-        stack: [0u64; 8],
+        stack: [0u64; 16],
         stack_len: 0,
         owner: if has_owner { Some(9999) } else { None },
         edges_out: vec![0u64; edges_out_count],

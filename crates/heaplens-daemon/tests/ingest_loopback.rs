@@ -5,8 +5,8 @@ use heaplens_daemon::resolver::Resolver;
 use tokio::sync::mpsc;
 
 fn make_alloc_event(ptr: u64, size: u64, ts: u64, stack: &[u64]) -> AllocEvent {
-    let mut s = [0u64; 8];
-    let len = stack.len().min(8);
+    let mut s = [0u64; 16];
+    let len = stack.len().min(16);
     s[..len].copy_from_slice(&stack[..len]);
     AllocEvent::new(EventKind::Alloc, ptr, 0, size, 8, ts, s, len as u8)
 }
@@ -33,16 +33,18 @@ async fn loopback_alloc_and_tick_produces_diff() {
     drop(tx);
 
     let mut graph = OwnershipGraph::new();
-    let resolver = Resolver::new();
+    let mut resolver = Resolver::new();
+    resolver.insert(0xAAAA, "owner_site".to_owned(), false);
+    resolver.insert(0xBBBB, "leaf_site".to_owned(), false);
 
     while let Some(msg) = rx.recv().await {
         match msg {
             GraphMsg::Events(events) => {
                 for ev in &events {
                     match ev.kind {
-                        0 => graph.on_alloc(ev),
+                        0 => graph.on_alloc(ev, &resolver),
                         1 => graph.on_dealloc(ev.ptr),
-                        2 => graph.on_realloc(ev.old_ptr, ev.ptr, ev.size),
+                        2 => graph.on_realloc(ev.old_ptr, ev.ptr, ev.size, &resolver),
                         _ => {}
                     }
                 }
@@ -65,6 +67,7 @@ async fn loopback_alloc_and_tick_produces_diff() {
                     GraphMessage::Snapshot { .. } => panic!("expected Diff, got Snapshot"),
                 }
             }
+            GraphMsg::Symbols(_) => {}
         }
     }
 }
@@ -78,7 +81,7 @@ async fn loopback_dealloc_produces_remove() {
     tx.send(GraphMsg::Tick).unwrap();
 
     // Now dealloc (EventKind::Dealloc)
-    let dealloc_ev = AllocEvent::new(EventKind::Dealloc, 0x1000, 0, 0, 0, 200, [0u64; 8], 0);
+    let dealloc_ev = AllocEvent::new(EventKind::Dealloc, 0x1000, 0, 0, 0, 200, [0u64; 16], 0);
     tx.send(events_to_msg(&[dealloc_ev])).unwrap();
     tx.send(GraphMsg::Tick).unwrap();
     drop(tx);
@@ -92,9 +95,9 @@ async fn loopback_dealloc_produces_remove() {
             GraphMsg::Events(events) => {
                 for ev in &events {
                     match ev.kind {
-                        0 => graph.on_alloc(ev),
+                        0 => graph.on_alloc(ev, &resolver),
                         1 => graph.on_dealloc(ev.ptr),
-                        2 => graph.on_realloc(ev.old_ptr, ev.ptr, ev.size),
+                        2 => graph.on_realloc(ev.old_ptr, ev.ptr, ev.size, &resolver),
                         _ => {}
                     }
                 }
@@ -110,6 +113,7 @@ async fn loopback_dealloc_produces_remove() {
                     }
                 }
             }
+            GraphMsg::Symbols(_) => {}
         }
     }
 

@@ -393,11 +393,182 @@ Responsibilities (methods):
 - `on_alloc(ev)`: create a `Node`; run `infer_ownership` (φ) using the current set of live nodes and `ev.stack`; set `owner` + push to owner's `edges_out`; mark added.
 - `on_dealloc(ptr)`: mark node freed; for each live child whose `owner == this`, set child `owner = None` and mark it an **orphan candidate** (final orphan status decided by the age check in `anomaly`); mark updated/removed.
 - `on_realloc(old, new, size)`: migrate the node's key and update size.
-- `infer_ownership(stack) -> Option<u64>` (φ): find the most recent live node whose allocation site (its `stack[0]` symbol, or any frame) appears in `stack`. Heuristic; document.
+- `infer_ownership(stack) -> Option<u64>` (φ): find the most recent live node whose *enclosing function* — not exact instruction — appears in `stack` at depth ≥ 1 (the new node's own site is excluded, so sibling allocations from the same call site never match each other). Granularity is the function, not the instruction: two different allocation statements in the same function resolve to different addresses but the same symbol name, and only name-level matching links a container's own allocation to allocations its own code later triggers elsewhere in the same function (confirmed necessary against a real compiled binary — exact-address matching produced zero edges for this exact shape). This is a deliberate widening of what an edge claims: not "allocated at the owner's exact site" but "allocated on a call path passing through the owner's allocating function." Known, accepted, tested limitation: two unrelated containers allocated directly in the same calling function are indistinguishable φ candidates for a later child of either; the greatest-ts tie-break resolves the ambiguity without regard to which container is actually responsible (see `phi_ambiguity_two_unrelated_containers_in_same_function` in `graph_unit.rs`). Frames are classified machinery vs. real call site by the writer thread (see `writer.rs`'s `is_machinery_symbol`), shipped via the SYMBOLS frame; unresolved/unknown addresses are treated as machinery and cannot match anything. Heuristic by design; do not read an edge as a proof of ownership.
 - `connected_components() -> usize`: for topological fragmentation.
 - `drain_diff() -> GraphDiff`: produce and clear the pending diff (maps `Node` → `NodeDto`, attaching `symbol` from `resolver`).
 
 The graph task owns this struct and processes commands from an `mpsc` receiver. No locks.
+
+#### φ's tie-break rule, stated precisely
+
+Among live nodes whose effective-site name matches, **the discriminator is
+recency: greatest `ts`, tie-broken by greatest `id`.** This is not a
+dynamic-extent or thread-aware check — `Node` carries no thread id, no
+call/return bracketing. It is "which same-named node was most recently
+allocated," nothing more. Two consequences, both tested:
+
+- **When it works (the common case for this project's producers):** a
+  function invoked K times, each invocation's allocations nested/sequential
+  (invocation *i*'s children all land strictly between invocation *i*'s `ts`
+  and invocation *i+1*'s `ts`) — recency exactly recovers the true owner,
+  because the true owner is definitionally the most-recently-allocated
+  same-name live node at that point. `wire_producer`'s 100 `nested_alloc`
+  calls are exactly this shape (each `outer` stays live in the caller's
+  `Vec` while the loop continues, so all prior owners remain candidates, and
+  recency still resolves correctly). Locked in by
+  `phi_k_invocations_of_same_function_partition_by_recency_when_sequential`
+  in `graph_unit.rs`.
+- **When it doesn't:** an allocation logically belonging to an earlier
+  owner, but which arrives on the wire *after* a newer same-name owner
+  already exists (non-nested/overlapping access — e.g. two threads both
+  inside the same allocating function, or any interleaving where an early
+  owner's later allocation is delayed past a later owner's start) gets
+  attributed to the newer owner. Documented and tested, not silently wrong:
+  `phi_recency_discriminator_misattributes_late_child_to_newer_same_name_owner`
+  in `graph_unit.rs`.
+
+The demo (`demo_producer`)'s owner has edges to both its 20 `leaf_alloc`
+children **and** its own `children: Vec<Vec<u8>>` backing-array allocation —
+the backing array is not a second root because it is allocated inside
+`make_family` itself, at a point strictly earlier than any of the 20
+children, so it never becomes ambiguous; it is simply another same-function
+allocation the owner (correctly, by the tie-break's own logic) claims before
+any child could contend for it.
+
+#### Structural predicates — not derived, configurable heuristics
+
+- `hot_cluster_threshold` (default 32, `HEAPLENS_HOT_THRESHOLD` env override):
+  an empirically-chosen fan-out heuristic, not a value derived from any
+  model. State this plainly rather than implying derivation.
+- `tau_ms` (default 5000): **not detection latency.** A node's `state`
+  transitions to `Orphan` structurally, the instant its owner frees and the
+  age check in `anomaly::sweep` next runs (bounded by `tick_ms`, ~33ms) —
+  the 5-second window governs when the *visual* fade/coral treatment shows
+  in the UI, chosen for human observability during the demo, not as a
+  measure of how fast the system detects orphaning. H1's latency
+  measurement is defined against the structural transition, not the visual
+  one; a reader who conflates the two will score `tau_ms` as measurement
+  lag it isn't.
+
+#### For the mémoire (Chapter 3, φ's formal definition)
+
+> φ attributes ownership at allocating-function granularity rather than at
+> instruction granularity. A consequence is that allocations made directly
+> within the owner's own function — such as a container's backing storage or
+> its reallocations during growth — are counted as children of that owner by
+> construction, not as independent roots. This is a deliberate property of
+> the granularity choice, resolved by the tie-break rule (recency among live,
+> same-function candidates): among same-function allocations, the earliest
+> live one is the owner and subsequent ones are its children.
+
+#### Jury Q&A
+
+- *"Two threads both inside the same allocating function — do children
+  cross-link?"* → Yes, in the specific case where an earlier owner's
+  allocation arrives after a later same-name owner already exists; this is
+  the recency discriminator's known limitation, tested directly (see above),
+  not a hand-wave.
+- *"Why is the Vec's backing array a child, not a root?"* → Function
+  granularity plus the recency tie-break; it's allocated earlier than any
+  child, inside the owner's own function.
+- *"Function matching is looser than address matching — where are your false
+  positives?"* → Bounded by the tie-break and tested directly: no node
+  exceeds 1 edge in the pair test, the K-invocation test proves clean
+  partitioning under the actual nested-access pattern this project's
+  producers use, and the misattribution test names the one case where it
+  breaks instead of asserting soundness the design doesn't have.
+- *"Why 32? Why 5 seconds?"* → Both configurable, empirically-chosen,
+  structural (not rate-based) heuristics — not derived values. `tau_ms` is a
+  visual-fade window, not detection latency.
+
+#### φ's operating envelope under optimized (release) builds
+
+φ resolves ownership from stack-frame *symbol names*, not raw addresses.
+The load-bearing requirement this creates, and one further property of the
+search itself, were both confirmed empirically (live `wire_producer.exe`
+runs), not reasoned about in the abstract:
+
+1. **φ requires the observed binary to carry debug info — inlining is not
+   the operative condition, symbolizability is.** Rust's default `release`
+   profile omits debug info. Without it, `backtrace::resolve` cannot find a
+   name for any address whose function has no corresponding entry, and
+   falls back to the nearest preceding *exported* symbol instead — silently
+   collapsing every internal call site (e.g. `nested_alloc`, `leaf_alloc`)
+   onto whatever public symbol happens to sit before it in the binary
+   (observed: everything resolved to `wire_producer::main`). This produced
+   zero ownership edges end-to-end and looked exactly like the earlier
+   inlining-related bugs found on this branch, but was a distinct and
+   simpler root cause that subsumes it: `#[inline(never)]` on the producer
+   examples' allocation-site functions (already present from an earlier
+   fix) does nothing to address a missing symbol table — a function can be
+   correctly un-inlined, present as its own stack frame, and *still*
+   resolve to the wrong name if the binary carries no debug info for it.
+   The fix is `[profile.release] debug = true` in the workspace
+   `Cargo.toml`, added and confirmed by re-running the full release-mode
+   suite (including a live `wire_producer.exe` run showing
+   `wire_producer::nested_alloc`/`leaf_alloc` resolving correctly): a
+   build-configuration requirement, not an inference-logic change. **Any
+   deployment or benchmark build of HeapLens must carry full debug info
+   even in release, or φ's attribution silently degrades to near-zero
+   edges without any error** — this is now permanent, not opt-in, and
+   applies to every future release build on this workspace, including H2.
+2. **Whole-stack search means long-lived enclosing containers accumulate
+   transitive ownership — correct ancestry, not a defect.** φ searches the
+   *entire* remaining ancestor stack above a new allocation's own effective
+   site, not just its immediate caller. A container allocated once in `main`
+   and held alive for an entire program's run (e.g. `wire_producer`'s
+   `items: Vec::with_capacity(100)`) is therefore attributed as owner of
+   every allocation made anywhere within its dynamic scope, in addition to
+   each of those allocations owning its own nested children — yielding a
+   real multi-level chain (root container → outer → inner), not the flat
+   independent-pairs shape a smaller/shorter-lived producer scenario might
+   suggest. The immediate-caller-only alternative was considered and
+   rejected: it would blind φ to any ownership relationship deeper than one
+   stack frame, which is worse than the chain-accumulation property it would
+   avoid. `cross_process_wire.rs`'s topology assertions were updated to
+   assert this shape positively (root owns N outers, each outer owns exactly
+   one inner, no node has more than one owner) rather than asserting "no
+   owner is ever owned" — an idealized flat-pairs invariant that only ever
+   held because finding 1 above was, until fixed, masking this ancestry
+   entirely by collapsing all symbol resolution to a single name.
+
+Both are properties every stack-based profiler shares (heaptrack, perf,
+VTune all require frame-pointer or debug-info builds for usable attribution)
+— φ inherits the limitation honestly rather than hiding it.
+
+**For the mémoire, Chapter 3 (φ's formal definition):** φ's ownership claim
+is not defined over source-level call structure but over the *observed,
+symbolized* call structure — inference presupposes that every frame it
+walks resolves to a real function name. An optimized binary without debug
+info exposes less call structure than its source (frames still exist and
+are walked correctly, but resolve to the wrong name), and φ's attribution
+coverage degrades accordingly, all the way to near-total collapse. This is
+a precondition of the technique, stated alongside the granularity and
+tie-break rules already documented above, not a separate footnote.
+
+**For the mémoire, Chapter 5 (limitations):** shipping debug info in a
+release build is standard practice for observability tooling generally —
+profilers, crash reporters, and APM agents all do this deliberately,
+trading it off against binary size, not runtime speed. `debug = true` adds
+PDB-equivalent symbol data to the binary; it does not change the compiled
+code the CPU executes (opt-level, inlining, and codegen are governed by
+`opt-level` and related flags, untouched by this setting). Concretely for
+this project: the daemon's and allocator's own runtime performance —
+including the batching/ring-buffer critical path H2 measures — is
+unaffected by `debug = true`; only symbol-table size changes. This means
+H2's benchmarks, once unfrozen, must be run against this exact profile
+(`[profile.release] debug = true`, as committed in the workspace
+`Cargo.toml`) so the reported numbers describe the shipped configuration,
+not a hypothetical stripped-symbol build that was never actually
+delivered.
+
+Mitigation for a production deployment of this technique, where debug info
+cannot be shipped for size or IP reasons: frame-pointer-preserving builds
+(`-C force-frame-pointers=yes`) recover enough structure for perf/heaptrack
+attribution without full symbol tables, though φ's function-name matching
+specifically still needs symbol resolution to work and would need further
+adaptation (e.g. address-range-based fallback) — out of scope for this
+project, noted here for completeness.
 
 ### 5.4 `resolver.rs` — symbol table
 

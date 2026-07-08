@@ -52,9 +52,11 @@ pub async fn run(pipe_name: String, tx: mpsc::UnboundedSender<GraphMsg>) {
                             Frame::Events(events) => {
                                 let _ = tx.send(GraphMsg::Events(events));
                             }
-                            Frame::Symbols(_) | Frame::Handshake { .. } => {
-                                // Client-supplied symbol names are ignored; the daemon resolves
-                                // addresses via its own Resolver. Handshake is informational.
+                            Frame::Symbols(syms) => {
+                                let _ = tx.send(GraphMsg::Symbols(syms));
+                            }
+                            Frame::Handshake { .. } => {
+                                // Informational only — pid/process name not currently used.
                             }
                         }
                     }

@@ -15,7 +15,7 @@ use heaplens_daemon::{
 // ---------------------------------------------------------------------------
 
 fn make_alloc_ev(ptr: u64, ts: u64, stack0: u64) -> AllocEvent {
-    let mut stack = [0u64; 8];
+    let mut stack = [0u64; 16];
     stack[0] = stack0;
     AllocEvent::new(EventKind::Alloc, ptr, 0, 64, 8, ts, stack, 1)
 }
@@ -44,13 +44,14 @@ async fn run_graph_loop(
                 Some(GraphMsg::Events(events)) => {
                     for ev in &events {
                         match ev.kind {
-                            0 => graph.on_alloc(ev),
+                            0 => graph.on_alloc(ev, &resolver),
                             1 => graph.on_dealloc(ev.ptr),
-                            2 => graph.on_realloc(ev.old_ptr, ev.ptr, ev.size),
+                            2 => graph.on_realloc(ev.old_ptr, ev.ptr, ev.size, &resolver),
                             _ => {}
                         }
                     }
                 }
+                Some(GraphMsg::Symbols(_)) => {}
                 Some(GraphMsg::Tick) => {
                     let diff = graph.drain_diff(&resolver);
                     if is_non_empty_diff(&diff) {
@@ -182,7 +183,7 @@ async fn ws_snapshot_then_diff_consistent() {
     assert_eq!(snapshot_ids.len(), 3, "snapshot must contain all 3 pre-allocated nodes");
 
     // Dealloc the first node (ptr 0x1000) and tick.
-    let dealloc = AllocEvent::new(EventKind::Dealloc, 0x1000, 0, 0, 0, 200, [0u64; 8], 0);
+    let dealloc = AllocEvent::new(EventKind::Dealloc, 0x1000, 0, 0, 0, 200, [0u64; 16], 0);
     graph_tx.send(GraphMsg::Events(vec![dealloc])).unwrap();
     graph_tx.send(GraphMsg::Tick).unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
