@@ -2,7 +2,7 @@ use heaplens_alloc::ring;
 use heaplens_protocol::{AllocEvent, EventKind};
 
 fn ev(n: u64) -> AllocEvent {
-    AllocEvent::new(EventKind::Alloc, n, 0, 64, 8, n, [0u64; 8], 0)
+    AllocEvent::new(EventKind::Alloc, n, 0, 64, 8, n, [0u64; 16], 0)
 }
 
 #[test]

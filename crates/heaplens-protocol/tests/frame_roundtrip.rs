@@ -24,7 +24,7 @@ fn handshake_round_trip() {
 }
 
 fn sample_event(n: u64) -> AllocEvent {
-    let mut stack = [0u64; 8];
+    let mut stack = [0u64; 16];
     stack[0] = 0x7fff_0000_0000_0000 + n;
     AllocEvent::new(EventKind::Alloc, 0x2000_0000_0000 + n, 0, 64 + n, 8, 1_000_000 + n, stack, 1)
 }
@@ -48,19 +48,19 @@ fn events_round_trip_multiple() {
 
 #[test]
 fn symbols_round_trip_multiple() {
-    let syms: Vec<(u64, &str)> = vec![
-        (0x7fff_dead_0001, "alloc::vec::Vec::push"),
-        (0x7fff_dead_0002, "std::collections::HashMap::insert"),
-        (0x7fff_dead_0003, "my_crate::foo::bar"),
+    let syms: Vec<(u64, &str, bool)> = vec![
+        (0x7fff_dead_0001, "alloc::vec::Vec::push", true),
+        (0x7fff_dead_0002, "std::collections::HashMap::insert", false),
+        (0x7fff_dead_0003, "my_crate::foo::bar", false),
     ];
     let encoded = encode_symbols(&syms);
     let mut dec = make_decoder_with(&encoded);
     match dec.next().expect("expected a frame") {
         Frame::Symbols(decoded) => {
             assert_eq!(decoded.len(), 3);
-            assert_eq!(decoded[0], (syms[0].0, syms[0].1.to_owned()));
-            assert_eq!(decoded[1], (syms[1].0, syms[1].1.to_owned()));
-            assert_eq!(decoded[2], (syms[2].0, syms[2].1.to_owned()));
+            assert_eq!(decoded[0], (syms[0].0, syms[0].1.to_owned(), syms[0].2));
+            assert_eq!(decoded[1], (syms[1].0, syms[1].1.to_owned(), syms[1].2));
+            assert_eq!(decoded[2], (syms[2].0, syms[2].1.to_owned(), syms[2].2));
         }
         other => panic!("wrong variant: {other:?}"),
     }

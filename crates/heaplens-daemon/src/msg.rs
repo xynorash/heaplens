@@ -6,6 +6,10 @@ use heaplens_protocol::{AllocEvent, GraphMessage, NodeDto};
 pub enum GraphMsg {
     /// A batch of allocation events decoded from a single pipe frame.
     Events(Vec<AllocEvent>),
+    /// (addr, resolved name, is_machinery) tuples from a SYMBOLS frame — the
+    /// writer resolves and classifies addresses off its own hot path; the
+    /// daemon just records the classification into its Resolver.
+    Symbols(Vec<(u64, String, bool)>),
     /// Periodic tick from the timer — triggers drain_diff and log emission.
     Tick,
 }

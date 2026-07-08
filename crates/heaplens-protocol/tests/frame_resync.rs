@@ -6,7 +6,7 @@ fn resync_after_absurd_length_prefix() {
     // Two valid frames sandwiching junk with an absurd length prefix.
     // The junk bytes must not prevent either valid frame from decoding.
     let event = AllocEvent::new(
-        EventKind::Dealloc, 0x5555_0000_0001, 0, 64, 8, 1, [0u64; 8], 0,
+        EventKind::Dealloc, 0x5555_0000_0001, 0, 64, 8, 1, [0u64; 16], 0,
     );
     let valid1 = encode_handshake(1, "before-junk");
     let valid2 = encode_events(&[event]);

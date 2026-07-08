@@ -2,7 +2,7 @@ use heaplens_protocol::{AllocEvent, EventKind, Frame, FrameDecoder, encode_event
 
 #[test]
 fn single_frame_fed_one_byte_at_a_time() {
-    let mut stack = [0u64; 8];
+    let mut stack = [0u64; 16];
     stack[0] = 0x7fff_cafe_babe_0001;
     let event = AllocEvent::new(
         EventKind::Realloc,

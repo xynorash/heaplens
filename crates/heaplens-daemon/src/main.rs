@@ -62,7 +62,7 @@ async fn main() -> anyhow::Result<()> {
 
     // 10. Graph state.
     let mut graph = OwnershipGraph::new();
-    let resolver = Resolver::new();
+    let mut resolver = Resolver::new();
     let mut storm_tracker = StormTracker::new();
     let mut warned_sites: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
@@ -74,7 +74,7 @@ async fn main() -> anyhow::Result<()> {
                     for ev in &events {
                         match ev.kind {
                             0 => {
-                                graph.on_alloc(ev);
+                                graph.on_alloc(ev, &resolver);
                                 // Storm detection on alloc events with a non-empty stack.
                                 if ev.stack_len > 0
                                     && storm_tracker.record(ev.stack[0], ev.ts_nanos, &config)
@@ -87,9 +87,14 @@ async fn main() -> anyhow::Result<()> {
                                 }
                             }
                             1 => graph.on_dealloc(ev.ptr),
-                            2 => graph.on_realloc(ev.old_ptr, ev.ptr, ev.size),
+                            2 => graph.on_realloc(ev.old_ptr, ev.ptr, ev.size, &resolver),
                             _ => {}
                         }
+                    }
+                }
+                Some(GraphMsg::Symbols(syms)) => {
+                    for (addr, name, is_machinery) in syms {
+                        resolver.insert(addr, name, is_machinery);
                     }
                 }
                 Some(GraphMsg::Tick) => {

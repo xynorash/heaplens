@@ -4,5 +4,23 @@ members = [
     "crates/heaplens-protocol",
     "crates/heaplens-alloc",
     "crates/heaplens-daemon",
+    "crates/heaplens-launcher",
     # TODO: heaplens-flutter (Stage 4)
 ]
+
+[profile.release]
+# φ resolves ownership from stack-frame symbol names (writer.rs's
+# is_machinery_symbol / graph.rs's effective_site). Rust's default release
+# profile omits debug info, so backtrace::resolve falls back to the nearest
+# preceding *exported* symbol for any function without one — every internal
+# call site (e.g. nested_alloc, leaf_alloc in the producer examples)
+# resolves to whatever public symbol happens to sit before it in the
+# binary (observed: all collapsed onto "wire_producer::main"), which
+# destroys φ's function-name matching even though the frames themselves are
+# correctly walked. Confirmed via a live release wire_producer run: without
+# this, distinct call sites vanish entirely from resolved symbol names;
+# with it, wire_producer::leaf_alloc/nested_alloc resolve correctly and
+# distinctly. This is unrelated to inlining — #[inline(never)] on the
+# producer examples' allocation-site functions is still correct practice
+# and is kept, but by itself does not fix this.
+debug = true

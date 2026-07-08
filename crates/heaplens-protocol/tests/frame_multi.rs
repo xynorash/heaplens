@@ -4,11 +4,11 @@ use heaplens_protocol::{AllocEvent, EventKind, Frame, FrameDecoder,
 #[test]
 fn three_frames_in_one_push() {
     let event = AllocEvent::new(
-        EventKind::Alloc, 0x1000_0000_0001, 0, 128, 8, 42_000_000, [0u64; 8], 0,
+        EventKind::Alloc, 0x1000_0000_0001, 0, 128, 8, 42_000_000, [0u64; 16], 0,
     );
     let f1 = encode_handshake(99, "multi-test");
     let f2 = encode_events(&[event]);
-    let f3 = encode_symbols(&[(0x7fff_1234_5678, "some::symbol")]);
+    let f3 = encode_symbols(&[(0x7fff_1234_5678, "some::symbol", false)]);
 
     let mut combined = Vec::new();
     combined.extend_from_slice(&f1);
@@ -37,7 +37,7 @@ fn three_frames_in_one_push() {
     match dec.next().expect("frame 3") {
         Frame::Symbols(syms) => {
             assert_eq!(syms.len(), 1);
-            assert_eq!(syms[0], (0x7fff_1234_5678, "some::symbol".to_owned()));
+            assert_eq!(syms[0], (0x7fff_1234_5678, "some::symbol".to_owned(), false));
         }
         other => panic!("frame 3 wrong variant: {other:?}"),
     }

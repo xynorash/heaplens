@@ -1,0 +1,7 @@
+/target/
+/dist/
+/heaplens_flutter/build/
+/heaplens_flutter/.dart_tool/
+/.idea/
+*.log
+heaplens.db

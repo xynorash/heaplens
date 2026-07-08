@@ -28,13 +28,21 @@ pub struct AllocEvent {
     pub old_ptr:   u64,
     pub size:      u64,
     pub ts_nanos:  u64,
-    pub stack:     [u64; 8],
+    /// Raw, unfiltered instruction pointers from the capture point downward.
+    /// 16 frames (up from 8): the zeroed-allocation path (`vec![0u8; n]`,
+    /// the idiom used throughout this project's producers) inserts 6+
+    /// non-inlined std frames between the shared instrumentation and the
+    /// real call site, so 8 frames can contain zero user frames. Consumers
+    /// (daemon-side phi matching, symbol display) locate the real call site
+    /// by classifying frames via the writer-resolved SYMBOLS frame, not by
+    /// a fixed index — see heaplens-daemon's graph.rs `effective_site`.
+    pub stack:     [u64; 16],
 }
 
 const _: () = assert!(core::mem::size_of::<AllocEvent>() == AllocEvent::SIZE);
 
 impl AllocEvent {
-    pub const SIZE: usize = 104;
+    pub const SIZE: usize = 168;
 
     #[allow(clippy::too_many_arguments)]
     pub fn new(
@@ -44,7 +52,7 @@ impl AllocEvent {
         size:      u64,
         align:     u32,
         ts_nanos:  u64,
-        stack:     [u64; 8],
+        stack:     [u64; 16],
         stack_len: u8,
     ) -> Self {
         AllocEvent {
@@ -87,13 +95,13 @@ mod tests {
 
     #[test]
     fn t1_size_of_alloc_event() {
-        assert_eq!(core::mem::size_of::<AllocEvent>(), 104);
-        assert_eq!(AllocEvent::SIZE, 104);
+        assert_eq!(core::mem::size_of::<AllocEvent>(), 168);
+        assert_eq!(AllocEvent::SIZE, 168);
     }
 
     #[test]
     fn t2_round_trip() {
-        let mut stack = [0u64; 8];
+        let mut stack = [0u64; 16];
         stack[0] = 0x0000_7fff_dead_beef;
         stack[1] = 0x0000_7fff_cafe_babe;
         stack[2] = 0x0000_7fff_1234_5678;
