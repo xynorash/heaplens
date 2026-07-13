@@ -299,3 +299,67 @@ impl OwnershipGraph {
         }
     }
 }
+
+#[cfg(test)]
+mod invariant_tests {
+    use super::*;
+
+    /// φ's core invariant, stated directly rather than only observed
+    /// through `on_alloc`'s resulting edges: **an owner's own effective
+    /// site name must appear in the set of names a would-be child searches
+    /// for.** `effective_site_name` (how a node names itself) and
+    /// `infer_ownership`'s search set (how a child looks for an owner) are
+    /// two separate computations over two different stacks; nothing in the
+    /// type system forces them to agree. They *happen* to agree today
+    /// because both call the same `effective_site_index`/`is_machinery`
+    /// skip rule — but that agreement is exactly what the
+    /// `Vec::with_capacity` bug violated one layer upstream, when
+    /// `is_machinery_symbol` (in `heaplens-alloc`) classified one stdlib
+    /// allocation idiom differently from another, silently shifting where
+    /// `effective_site_index` landed for a container's own stack without
+    /// touching how children compute their search sets. This test pins the
+    /// invariant down explicitly so a future change to either computation
+    /// (not just to the classifier) that breaks their agreement fails here,
+    /// not three stages later against a real target.
+    #[test]
+    fn owner_effective_site_name_matches_the_name_a_childs_search_set_looks_for() {
+        let mut r = Resolver::new();
+        // Owner's own stack: a stdlib allocation-plumbing frame (machinery)
+        // sitting in front of the owner's real call site — exactly the
+        // Vec::with_capacity shape (own_idx must skip past the plumbing
+        // frame to reach the real site, not stop on it).
+        r.insert(0xAAA1, "alloc::vec::Vec<T>::with_capacity".to_owned(), true);
+        r.insert(0xAAA2, "myapp::main".to_owned(), false);
+        // Child's own stack: its own real site, then the SAME real
+        // ancestor site the owner names itself by.
+        r.insert(0xBBB1, "myapp::helper".to_owned(), false);
+
+        let mut owner_stack = [0u64; 16];
+        owner_stack[0] = 0xAAA1;
+        owner_stack[1] = 0xAAA2;
+        let owner_name = OwnershipGraph::effective_site_name(&owner_stack, 2, &r)
+            .expect("owner must resolve to a real effective site, not the machinery frame");
+        assert_eq!(
+            owner_name, "myapp::main",
+            "owner's effective site must skip the machinery frame and land on its real call site"
+        );
+
+        let mut child_stack = [0u64; 16];
+        child_stack[0] = 0xBBB1;
+        child_stack[1] = 0xAAA2;
+        let child_own_idx = OwnershipGraph::effective_site_index(&child_stack, 2, &r)
+            .expect("child must resolve its own effective site");
+        let child_search_set: HashSet<String> = child_stack[child_own_idx + 1..2]
+            .iter()
+            .copied()
+            .filter(|&a| a != 0 && !r.is_machinery(a))
+            .map(|a| r.name_for(a))
+            .collect();
+
+        assert!(
+            child_search_set.contains(&owner_name),
+            "the owner's effective site name must appear in the child's search set — \
+             got owner_name={owner_name:?}, child_search_set={child_search_set:?}"
+        );
+    }
+}
