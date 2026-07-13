@@ -576,14 +576,34 @@ buffer + writer thread (reused from `heaplens-alloc`), pipe connection,
 `HeapLensHookDetach` cleanly uninstalling hooks and stopping the writer
 thread.
 
-**Acceptance gate:** with `heaplens-daemon` running standalone (as it does
-today for cooperative producers), the test harness self-attaches, performs
-a scripted sequence of allocs/reallocs/frees on its own heap, and the
-daemon's existing tooling (whatever is already used to inspect
-`AllocEvent`s from a cooperative producer — same verification path as
-Stage 2/3) shows the correct event sequence. Then self-detaches and the
-harness exits cleanly with hooks fully removed (verify via a second
-allocation burst *after* detach showing no captured events).
+**Acceptance gate — must assert correctness, not just "it ran."** A gate
+that only confirms the DLL loads and doesn't crash would pass with a
+silently broken capture path, and step 6 would inherit exactly the
+ambiguity §7's step 6 ordering rule was designed to eliminate. This gate
+holds capture to the same bar Stage 2's allocator was held to:
+
+1. With `heaplens-daemon` running standalone (as it does today for
+   cooperative producers), the test harness self-attaches and runs a
+   **known, scripted workload with predetermined shape** — a fixed number
+   of allocs of specific sizes, a fixed number of reallocs (including at
+   least one on an untracked/pre-attach-simulated pointer to exercise the
+   §1.4 fallback), a fixed number of frees.
+2. **The gate asserts, not just observes:** the daemon-side event count for
+   the session equals the workload's known event count exactly; each
+   captured `AllocEvent.size` matches the corresponding workload
+   allocation's requested size exactly; no event is missing and no
+   duplicate/phantom event appears. This is a pass/fail numeric comparison
+   against the scripted workload, the same rigor as Stage 2's allocator
+   tests — "the daemon received *something*" does not pass this gate.
+3. Then self-detaches; a second, equally scripted allocation burst
+   performed *after* detach must produce **zero** captured events at the
+   daemon, confirmed by the same count assertion (zero, not "fewer" or
+   "looks quiet") — proving hooks are fully removed, not just quiesced.
+
+Only a gate written this way — fixed workload in, fixed count/size
+assertion out, both before and after detach — proves the capture pipeline
+itself is correct in isolation, before injection introduces its own
+variables in Step 2.
 
 ### Step 2 — `heaplens-injector`, tested against the Step 1 harness as the target
 
@@ -641,16 +661,36 @@ allocates. This is the first point where the whole chain (hook → injector
 Add the bounded-timeout `Shutdown`-then-detach step to the launcher's
 existing ordered shutdown sequence.
 
-**Acceptance gate:** with a target attached via Step 4's UI, close the
-HeapLens app window. Confirm (via the target's own continued execution,
-plus a way to check whether MinHook's hooks are still installed — e.g. the
-Step 1 harness logging its own hook state) that the target has its hooks
-cleanly removed before the daemon exits, within the bounded timeout.
-Separately, verify the timeout fallback: attach to a target, then make the
-detach hang deliberately (e.g. a debug build of the harness that ignores
-`HeapLensHookDetach` on command), close HeapLens, and confirm the launcher
-still tears down within timeout-plus-a-small-margin rather than hanging
-indefinitely — proving the fallback in §4.6 point 3 actually holds.
+**Acceptance gate — deliberately partial at this step; do not mark step 5
+"done" on this alone.** Step 5's real-world scenario (attach a target,
+close HeapLens, confirm the hook is actually gone from that target) needs
+a working injection path to test honestly, and that path is still being
+proven out in Step 6. Claiming step 5 complete from an isolated test alone
+would repeat the exact mistake the review caught in the original §4.6
+draft — asserting a safety property before the mechanism that proves it
+exists. So step 5's gate here is scoped to what *can* be verified without
+a real target:
+
+- **Timeout-logic test, isolated:** stub or mock the detach round-trip
+  (the daemon side of the `Shutdown` message can be faked to either
+  respond promptly or never respond) and confirm the launcher waits for a
+  prompt response, and separately confirm it proceeds to its existing
+  teardown once the bounded timeout elapses on a non-responding stub —
+  without hanging indefinitely. This proves the launcher's timeout/fallback
+  *logic* is correct in isolation.
+- **Explicitly not proven here:** that a real hook is actually removed from
+  a real target as a result of this sequence. That property is real-target-
+  dependent and is deferred to Step 6.
+
+**The "no hook left resident" property is completed as an explicit
+checklist item in Step 6**, not claimed here: once Step 6's real injected
+target exists, close HeapLens with that target attached and confirm (via
+the target's own continued execution, plus a way to check whether MinHook's
+hooks are still installed — e.g. the Step 1 harness logging its own hook
+state) that the hook was cleanly removed within the bounded timeout before
+the daemon exited. Only once *that* checklist item passes is the full §4.6
+guarantee actually proven end to end — step 5's isolated gate is necessary
+but not sufficient on its own.
 
 ### Step 6 — end-to-end injection test, sequenced to avoid an ambiguous read
 
@@ -682,5 +722,15 @@ make it impossible to tell which one occurred.
    demonstration: "here is a real program we don't control, here is what
    the tool can and cannot tell you about it, and here is why."
 
-Only after both are observed and distinguished can Stage 7 be called
-functionally complete. Do not run step 2 before step 1 passes.
+3. **Checklist item carried over from Step 5 (§4.6's real proof):** with
+   target 1 (the debug-info-carrying target from item 1, still running)
+   attached, close the HeapLens app window and confirm the hook is fully
+   removed from that target within the bounded timeout — the same check
+   described at the end of Step 5, now run for real. Step 5's isolated
+   timeout-logic test is necessary but was explicitly not sufficient; this
+   is the item that actually closes it out. Do not consider §4.6 done, or
+   step 5 done, until this passes.
+
+Only after item 1, item 2, and item 3 are all observed and distinguished
+can Stage 7 be called functionally complete. Do not run step 2 before step
+1 passes.
