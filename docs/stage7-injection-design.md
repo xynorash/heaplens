@@ -120,6 +120,24 @@ bytes a cooperative producer already produces.
   attach-time forward," not a full heap snapshot — document this plainly as
   a known characteristic of the capture mode, both in this doc and in the
   eventual Flutter UI (a one-line note when an injected session starts).
+- **Realloc of a pre-attach pointer is the asymmetric case, and it's already
+  handled — confirmed, not assumed.** A pointer allocated before attach can
+  later be *reallocated* (not just freed) after attach. `HeapReAlloc` on
+  such a pointer produces a `Realloc` event whose `old_ptr` the daemon never
+  tracked. Verified directly against the current code
+  (`heaplens-daemon/src/graph.rs:130-154`, `Graph::on_realloc`): when
+  `old_ptr` is not found in `by_ptr`, the function does **not** drop the
+  event — it falls through to `self.on_alloc(...)` and registers `new_ptr`
+  as a brand-new node, exactly as if it had been a fresh allocation. This is
+  already the correct behavior for the injection case and needs no daemon
+  change. It is deliberately asymmetric with `on_dealloc`
+  (`graph.rs:92-96`, `Graph::on_dealloc`), which `return`s immediately on an
+  unknown `ptr` and drops the event: a realloc of an unknown pointer still
+  carries a real, current size and address worth tracking going forward
+  (there's a live allocation *right now*, we just missed its origin), while
+  a free of an unknown pointer has nothing left to track — the thing is
+  gone. Record this as an intentional, already-correct asymmetry, not an
+  oversight to fix.
 
 ---
 
@@ -355,29 +373,51 @@ than silently sitting on a stale graph.
 |---|---|
 | Clean detach (§4.1) | None — hooks fully removed, DLL unloaded |
 | Daemon dies mid-session | None — hook stays installed, drops events silently, target unaffected |
-| HeapLens app closed (via launcher teardown) | Same as daemon dying, from the target's perspective — the launcher's Job Object teardown kills the daemon, not the target; a follow-up detach is not guaranteed. **This is a gap** (§4.6). |
+| HeapLens app closed (via launcher teardown) | Handled — launcher requests a bounded-timeout detach before tearing down the daemon (§4.6). No longer an accepted gap. |
 | Target exits first | Pipe closes, daemon treats as normal disconnect, no target-side impact possible since the target is already gone |
 
-### 4.6 Known gap: launcher teardown does not guarantee detach
+### 4.6 Launcher teardown must request detach first (in scope, not deferred)
 
-The existing launcher (`heaplens-launcher`) kills the daemon via its Job
-Object the moment the Flutter app closes. If a target is injected at that
-moment, the daemon dies without getting a chance to send the
-`--detach` sequence, leaving the hook installed in the target (harmless per
-§4.3/§4.2, but not clean). Two options, to be decided at implementation
-time, not in this design:
-- Launcher-side: before closing, if a target is attached, wait for an
-  explicit detach round-trip (adds a shutdown-ordering dependency the
-  launcher doesn't have today).
-- Accept the gap: an installed-but-inert hook is safe (per §4.2/§4.3) even
-  if not tidy, and document it as "closing HeapLens while a target is
-  attached leaves the hook resident and harmless in that process until it
-  exits; explicitly detach first for a clean unload."
+**Revised from the initial draft, which proposed accepting this as a gap —
+that recommendation is wrong and is withdrawn.** "Harmless to the target's
+execution" (§4.2/§4.3 prove the target keeps running correctly with an
+abandoned hook) is not the same question as "acceptable to leave behind."
+Closing HeapLens while attached would otherwise leave live trampolines
+installed in a process the user doesn't own or control, invisible to that
+process's own user, removed only whenever that process happens to exit on
+its own. That is a persistent, silent modification to third-party software
+— a real responsibility problem even though it is provably safe, and not
+something to wave off with a safety argument that answers a different
+question.
 
-Recommendation: accept the gap for this stage and document it — the target
-is provably safe either way, and building shutdown ordering into the
-launcher is real scope for a corner case. Flag for revisit if the mémoire
-defense wants a stronger guarantee here.
+**In-scope fix:** the launcher already performs an ordered shutdown (it
+explicitly stops the daemon after the Flutter app exits, ahead of relying
+solely on the Job Object, per the existing `main.rs` teardown logic). This
+extends that same ordered sequence with one more step, before the existing
+daemon-stop:
+
+1. Flutter app exits (as today).
+2. **New:** launcher sends the daemon a `Shutdown` control message (small
+   addition to the same WS control channel used for `AttachTarget`/
+   `DetachTarget`, §3.1) if a target is currently attached; the daemon runs
+   the normal detach sequence (§3.4 steps 1–2, spawn
+   `heaplens-injector.exe <pid> --detach`, wait for the pipe to close) in
+   response.
+3. This wait is **bounded** — a short timeout (implementation detail, on
+   the order of a few seconds; exact value is an implementation-time
+   tuning choice, not a design commitment here). If the timeout elapses
+   (hung target, hung injector, anything), the launcher proceeds to its
+   existing teardown (kill daemon via Job Object) exactly as before. The
+   fallback on timeout is **the current behavior**, not a worse one — this
+   change can only improve the common case, never regress the timeout
+   case.
+4. Daemon and Flutter processes stop as today (unchanged).
+
+This is a small, additive change: one new control message, one bounded
+wait inserted into a shutdown sequence the launcher already performs in
+order. It does not change the launcher's process-spawning or Job Object
+logic. Promoted from §7's "out of scope" to in-scope for this stage — see
+the implementation plan (§8) for where it lands in build order.
 
 ---
 
@@ -409,10 +449,29 @@ genuine new regression worth re-opening systematic debugging on — but there
 is no evidence of that; the mechanism fully explains the historical
 observation without invoking a renderer bug.
 
-### 5.2 Proposed detail-surfacing additions (independent, scoped, optional)
+### 5.2 Proposed detail-surfacing additions — moved out of Stage 7 entirely
 
-These are small, independently-shippable UI improvements — not gated on
-injection landing first, and not required for injection to work:
+**Revised: these are not part of Stage 7 in any form.** They are recorded
+here because the original prompt asked for them, but they are Flutter-only
+rendering work, fully decoupled from injection, and must not be bundled
+into the injection branch — bundling them would entangle injection's
+acceptance testing with unrelated rendering changes, muddying what a test
+failure means. This is a **separate, later, named task**: "Stage 7b —
+graph detail surfacing" (or whatever sequence number is current when it's
+picked up), tracked independently and not started as part of this design's
+implementation plan (§8).
+
+**One exception, and it is conditional, not pulled forward as scheduled
+work:** the edge-opacity one-liner below (`0x33` → a higher default) may be
+worth doing sooner *only if* Nash's visual-gate observations (the
+already-in-flight φ re-verification, unrelated to this design) report edges
+being hard to see at the current alpha. That would be a one-line tuning
+change triggered by that observation, not by this design — it does not
+belong to Stage 7's scope or build order either way.
+
+These remain small, independently-shippable UI improvements when their
+time comes — not gated on injection landing first, and not required for
+injection to work:
 
 - **Always-visible compact node label.** Currently, per-node detail
   (`node_detail.dart`) is a selection-driven panel — you have to click a
@@ -460,10 +519,11 @@ Flutter-only rendering and layout work.
   use case, not just a build-configuration concern (§2).
 - **Flutter app:** No changes required for injection to function at the
   wire level. New: a process-picker screen/dialog and the WS calls it
-  makes. The detail-surfacing proposals (§5.2) are separate, optional work.
-- **Launcher (`heaplens-launcher`):** No changes required for injection to
-  function. Known gap at teardown (§4.6), explicitly not fixed in this
-  stage.
+  makes. The detail-surfacing proposals (§5.2) are **not** part of this
+  stage — moved to a separate, later task.
+- **Launcher (`heaplens-launcher`):** New: a bounded-timeout detach request
+  inserted into the existing ordered shutdown sequence, before the current
+  daemon-stop step (§4.6). This is now in-scope, not a deferred gap.
 - **New crates:** `heaplens-injector` (binary), `heaplens-hook` (cdylib).
   New dependency: `minhook`.
 
@@ -477,8 +537,150 @@ Flutter-only rendering and layout work.
   filtering/color-coding in Flutter.
 - Auto-elevation or any privilege escalation beyond a normal `OpenProcess`
   call (§3.3) — a deliberate security boundary, not a deferred feature.
-- Fixing the launcher-teardown detach gap (§4.6) — documented, accepted for
-  this stage.
 - The detail-surfacing UI proposals (§5.2) — designed here for completeness
-  since the prompt asked for them, but they are independent work, not a
-  precondition for or dependency of injection landing.
+  since the original prompt asked for them, but explicitly deferred to a
+  separate, later, independently-tracked task ("Stage 7b"), not bundled
+  into this stage's branch or acceptance testing.
+
+**No longer out of scope, revised from the initial draft:** the
+launcher-teardown detach fix (§4.6) was originally proposed as an accepted
+gap. That recommendation was wrong — "safe to leave behind" is not
+"acceptable to leave behind" for a persistent modification to a process
+HeapLens doesn't own — and it is now in-scope, specified in §4.6, and
+included in the build order (§8).
+
+---
+
+## 8. Staged implementation plan
+
+Each step below has its own acceptance gate. **Do not proceed to the next
+step until the current step's gate passes.** This mirrors the pattern
+already used for prior stages (M5 canvas-render, φ ownership fix): land and
+verify one layer before building the next on top of it, so a failure is
+always attributable to the step that just landed, not to an accumulation of
+unverified layers.
+
+### Step 1 — `heaplens-hook` (cdylib), tested by manual `LoadLibrary`, no injection yet
+
+Build the hook DLL in isolation first, loaded the *easy* way — a small test
+harness process that statically links nothing but calls
+`LoadLibraryW("heaplens_hook.dll")` on itself, then calls the exported
+`HeapLensHookAttach` directly (in-process, not via `CreateRemoteThread`).
+This isolates "does the hook itself work" from "does injection work,"
+which are separable concerns and should not be debugged simultaneously.
+
+Covers: MinHook installation on `HeapAlloc`/`HeapReAlloc`/`HeapFree`,
+thread-local reentrancy guard, private heap for internal allocations, ring
+buffer + writer thread (reused from `heaplens-alloc`), pipe connection,
+`Handshake` with real `pid`, event framing, clock rebased to attach-time,
+`HeapLensHookDetach` cleanly uninstalling hooks and stopping the writer
+thread.
+
+**Acceptance gate:** with `heaplens-daemon` running standalone (as it does
+today for cooperative producers), the test harness self-attaches, performs
+a scripted sequence of allocs/reallocs/frees on its own heap, and the
+daemon's existing tooling (whatever is already used to inspect
+`AllocEvent`s from a cooperative producer — same verification path as
+Stage 2/3) shows the correct event sequence. Then self-detaches and the
+harness exits cleanly with hooks fully removed (verify via a second
+allocation burst *after* detach showing no captured events).
+
+### Step 2 — `heaplens-injector`, tested against the Step 1 harness as the target
+
+Build the injector: architecture check (`IsWow64Process2`), `OpenProcess`
+with minimal rights, the two-step `CreateRemoteThread` sequence
+(`LoadLibraryW` then `HeapLensHookAttach`), and the symmetric detach
+sequence (`HeapLensHookDetach` then `FreeLibraryAndExitThread`).
+
+**Acceptance gate:** run the Step 1 test harness as a plain, unmodified,
+*already-running* process (no self-attach code path used this time), and
+have `heaplens-injector <pid> --attach` inject into it externally. Confirm
+identical results to Step 1's gate (event capture correct, clean detach)
+but now via real cross-process injection. Additionally verify the three
+validation paths from §3.3 (arch mismatch, access denied, target-exited)
+each produce the specified error message rather than crashing the injector
+or the target. This is the step where loader-lock safety (§4.1) and the
+private-heap reentrancy guard (§4.2) get their real test — they cannot be
+meaningfully verified until injection is happening into a separate process.
+
+### Step 3 — daemon WS control messages + process enumeration
+
+Add `ListProcesses`, `AttachTarget`, `DetachTarget`, and (§4.6) `Shutdown`
+to the existing WS control message enum. Implement `CreateToolhelp32Snapshot`-based
+enumeration, the daemon-side orchestration of spawning
+`heaplens-injector` (§3.2), the single-target transition sequence (§3.4,
+including graph-clear), and target-exit detection via the now-activated
+Handshake `pid` (§4.4).
+
+**Acceptance gate:** without any Flutter UI yet, drive these WS messages
+directly (a test script or `wscat`-equivalent against the daemon's existing
+WS endpoint) against the Step 1 harness as target. Confirm: process list
+includes the harness with correct pid/name/arch; `AttachTarget` results in
+events flowing and appearing in the daemon's graph; sending `AttachTarget`
+for a second target while one is attached correctly runs the full
+detach-then-clear-then-attach sequence (§3.4) with no stale nodes from the
+first target visible afterward; `DetachTarget` cleanly ends the session;
+target process exit is detected and reported without requiring an explicit
+`DetachTarget`.
+
+### Step 4 — Flutter process picker
+
+Add the picker screen/dialog: request `ListProcesses`, render the list,
+send `AttachTarget` on selection, surface attach-failure messages from §3.3
+verbatim, show "target process exited" per §4.4, show the attach-time-clock
+note per §1.4.
+
+**Acceptance gate:** end-to-end from the running Flutter app — open the
+picker, see the Step 1 harness (or any known test target) in the list,
+select it, watch the graph populate with real nodes as the target
+allocates. This is the first point where the whole chain (hook → injector
+→ daemon → WS → Flutter) is exercised together.
+
+### Step 5 — launcher teardown fix (§4.6)
+
+Add the bounded-timeout `Shutdown`-then-detach step to the launcher's
+existing ordered shutdown sequence.
+
+**Acceptance gate:** with a target attached via Step 4's UI, close the
+HeapLens app window. Confirm (via the target's own continued execution,
+plus a way to check whether MinHook's hooks are still installed — e.g. the
+Step 1 harness logging its own hook state) that the target has its hooks
+cleanly removed before the daemon exits, within the bounded timeout.
+Separately, verify the timeout fallback: attach to a target, then make the
+detach hang deliberately (e.g. a debug build of the harness that ignores
+`HeapLensHookDetach` on command), close HeapLens, and confirm the launcher
+still tears down within timeout-plus-a-small-margin rather than hanging
+indefinitely — proving the fallback in §4.6 point 3 actually holds.
+
+### Step 6 — end-to-end injection test, sequenced to avoid an ambiguous read
+
+**This sequencing matters and must not be skipped or reordered.** Two
+different failure modes look identical on screen — "injection captured
+nothing because injection is broken" and "injection captured allocations
+correctly but φ correctly shows zero ownership edges because the target
+has no debug info" — and testing against a stripped binary first would
+make it impossible to tell which one occurred.
+
+1. **First target: a program built by this project, with debug info
+   present**, e.g. one of the existing `heaplens-alloc` example producers
+   *built without* linking `heaplens-alloc` as its global allocator (so it
+   has no cooperative capture path — injection is the only way it gets
+   observed) but *with* `debug = true` (matching the release-profile fix
+   already in the workspace `Cargo.toml`). Attach and confirm: allocations
+   are captured, sizes are correct, **and φ produces real, meaningful
+   ownership edges** (a star or chain shape, matching the visual-gate
+   expectations already established for cooperative producers). This
+   proves the capture path is correct, independent of the φ-degradation
+   question — if this step doesn't produce edges, the bug is in injection
+   or capture, not in φ's expected degradation behavior.
+2. **Second target: a genuinely stripped, release-optimized third-party
+   binary** (no debug info available) that the project didn't build.
+   Attach and confirm: allocations are still captured (sizes, counts, the
+   memory-map view, leak-by-growth detection — everything §2 lists as
+   unaffected), while ownership edges degrade toward zero/roots, matching
+   §2's predicted, honest degradation. This step is the actual thesis
+   demonstration: "here is a real program we don't control, here is what
+   the tool can and cannot tell you about it, and here is why."
+
+Only after both are observed and distinguished can Stage 7 be called
+functionally complete. Do not run step 2 before step 1 passes.
