@@ -1,0 +1,20 @@
+[package]
+name = "heaplens-hook"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "heaplens_hook"
+crate-type = ["cdylib"]
+
+[dependencies]
+heaplens-protocol = { path = "../heaplens-protocol" }
+heaplens-alloc = { path = "../heaplens-alloc" }
+minhook = "0.9"
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }

@@ -2,8 +2,10 @@
 pub mod guard;
 #[doc(hidden)]
 pub mod ring;
-mod capture;
-mod writer;
+#[doc(hidden)]
+pub mod capture;
+#[doc(hidden)]
+pub mod writer;
 
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Once;
@@ -39,10 +41,43 @@ impl Default for HeapLensAlloc {
 
 static WRITER_ONCE: Once = Once::new();
 static WRITER_DEAD: AtomicBool = AtomicBool::new(false);
+static WRITER_SHOULD_STOP: AtomicBool = AtomicBool::new(false);
+static WRITER_STOPPED: AtomicBool = AtomicBool::new(false);
 
-/// Spawn the writer thread exactly once. Safe to call from the hot path:
-/// after the first successful call_once, subsequent calls are a single
-/// atomic load (no allocation, no blocking).
+/// Read by `writer::run`'s loop. Not exposed outside this crate — front-ends
+/// request shutdown via `request_writer_stop_and_wait`, they don't poll this
+/// directly.
+pub(crate) fn writer_should_stop() -> bool {
+    WRITER_SHOULD_STOP.load(Ordering::Acquire)
+}
+
+/// Set by `writer::run` immediately before it returns.
+pub(crate) fn mark_writer_stopped() {
+    WRITER_STOPPED.store(true, Ordering::Release);
+}
+
+/// Spawn the writer thread exactly once. Safe to call from the hot path for
+/// the cooperative `#[global_allocator]` front-end: after the first
+/// successful call_once, subsequent calls are a single atomic load (no
+/// allocation, no blocking).
+///
+/// **Not safe to reach lazily from an injected hook callback** (Stage 7,
+/// `heaplens-hook`) — confirmed empirically: spawning a thread from inside
+/// a MinHook-detoured `RtlAllocateHeap`/`HeapAlloc` call crashes
+/// (`STATUS_ACCESS_VIOLATION`), reproducibly, isolated by disabling every
+/// other part of `record()` in turn until only the `std::thread::spawn`
+/// call remained implicated. Root cause: `CreateThread`'s synchronous
+/// `DLL_THREAD_ATTACH` notifications run on the new thread before it's
+/// fully initialized, and something in that bootstrap path re-enters the
+/// hooked allocation function while the thread isn't in a state that
+/// tolerates it. `heaplens-hook`'s `HeapLensHookAttach` therefore calls
+/// `ensure_writer_started()` eagerly, from a normal (non-hook) thread
+/// context, before enabling any hook — see `docs/stage7-injection-design.md`
+/// §4 (this finding postdates and refines the design's original safety
+/// analysis, which did not anticipate this specific hazard). By the time
+/// any hook callback reaches this function, `WRITER_ONCE` has already
+/// fired, so the call below is a single atomic load — no thread is ever
+/// spawned from a hook callback.
 ///
 /// The spawn itself allocates ("heaplens-writer" thread name string), but it
 /// runs under the recursion guard, so those allocations are suppressed.
@@ -62,6 +97,79 @@ fn ensure_writer() {
     });
 }
 
+/// Public entry point for capture front-ends that cannot rely on `record`'s
+/// lazy spawn — currently `heaplens-hook`, which must start the writer
+/// thread from a normal thread context (its `HeapLensHookAttach`, before
+/// any hook is enabled) rather than from inside a hook callback. See the
+/// safety note on `ensure_writer` above.
+pub fn ensure_writer_started() {
+    ensure_writer();
+}
+
+/// Signals the writer thread to stop and waits (bounded by `timeout`) for
+/// it to actually do so. Returns `true` if it stopped in time.
+///
+/// **Required by `heaplens-hook`'s `HeapLensHookDetach` — and required to
+/// be called *after* hooks are disabled, not before.** Confirmed
+/// empirically as a fourth, distinct hazard in the same family as the two
+/// documented on `ensure_writer` and `warm_up_symbol_resolution`, this one
+/// the mirror image of the writer-thread-*creation* hazard: a thread
+/// *exiting* naturally also triggers `DLL_THREAD_DETACH` notifications and
+/// TLS-destructor cleanup on that thread, which itself performs heap
+/// operations. With hooks still active at that moment, those exit-time
+/// heap calls route through the detour during the exact window a thread is
+/// mid-teardown — isolated via the same disable-one-thing-at-a-time method
+/// as the other three hazards, and via diagnostic prints confirming the
+/// writer thread returned cleanly from `writer::run` immediately before the
+/// crash. The fix: `heaplens-hook`'s `HeapLensHookDetach` calls
+/// `MinHook::disable_all_hooks` *before* calling this function, so the
+/// writer thread's own exit-time heap traffic goes through the real,
+/// unhooked functions. See `docs/stage7-injection-design.md` §4.
+pub fn request_writer_stop_and_wait(timeout: std::time::Duration) -> bool {
+    WRITER_SHOULD_STOP.store(true, Ordering::Release);
+    let deadline = std::time::Instant::now() + timeout;
+    while !WRITER_STOPPED.load(Ordering::Acquire) {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    true
+}
+
+/// Forces `backtrace::resolve`'s one-time lazy initialization (on Windows,
+/// this loads and initializes `dbghelp.dll` — `SymInitialize` and friends)
+/// to happen now, synchronously, on the calling (normal) thread.
+///
+/// **Required before `heaplens-hook` enables any hook.** Confirmed
+/// empirically, the same way as the writer-thread-spawn hazard documented
+/// on `ensure_writer`: with the writer thread spawned eagerly (fixing that
+/// first hazard), the capture pipeline still crashed
+/// (`STATUS_ACCESS_VIOLATION`) the first time the writer thread's symbol
+/// resolution loop (`writer::run`'s `backtrace::resolve` call) ran with
+/// hooks already live — isolated via the same disable-one-thing-at-a-time
+/// method, and via diagnostic prints showing the crash follows immediately
+/// after the writer thread's first `backtrace::resolve` call. Root cause is
+/// the same *class* of hazard as the thread-spawn issue, one layer later:
+/// `dbghelp.dll`'s first load/`SymInitialize` does its own heavyweight,
+/// first-time OS-level setup (module enumeration, internal allocations),
+/// and doing that for the first time while `RtlAllocateHeap` is hooked
+/// process-wide is unsafe, whether it happens synchronously inside a hook
+/// callback (the earlier hazard) or asynchronously on a background thread
+/// racing against active hook traffic (this one). The general rule this
+/// establishes for `heaplens-hook`: **any first-time, heavyweight
+/// OS/runtime infrastructure initialization the capture pipeline depends
+/// on must be forced to completion before `MinHook::enable_all_hooks`**,
+/// never left lazy. See `docs/stage7-injection-design.md` §4.
+pub fn warm_up_symbol_resolution() {
+    // Resolve this very function's own address — always valid, always
+    // resolvable, and its result is intentionally discarded. The only goal
+    // is forcing whatever one-time setup `backtrace::resolve` performs to
+    // run now, on this thread, before any hook exists to race against it.
+    let addr = warm_up_symbol_resolution as *const () as *mut std::ffi::c_void;
+    backtrace::resolve(addr, |_sym| {});
+}
+
 /// Record one allocation event. Hot path.
 ///
 /// Invariants enforced here:
@@ -69,8 +177,14 @@ fn ensure_writer() {
 /// 2. Guard set via RAII ScopedGuard — cleared even on panic.
 /// 3. No allocation, no locking.
 /// 4. ring::push failure (full ring) is a silent drop.
+///
+/// Public so that other capture front-ends (e.g. `heaplens-hook`'s injected
+/// MinHook trampolines, which cannot use `#[global_allocator]`) can drive
+/// the same capture pipeline — ring, writer thread, symbol resolution, wire
+/// framing — from a different interception mechanism. See
+/// `docs/stage7-injection-design.md` §1.3.
 #[inline]
-fn record(kind: EventKind, ptr: u64, old_ptr: u64, size: u64, align: u32) {
+pub fn record(kind: EventKind, ptr: u64, old_ptr: u64, size: u64, align: u32) {
     // 1. Re-entrancy check — must be the very first thing.
     if guard::is_set() { return; }
 

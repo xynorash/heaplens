@@ -23,10 +23,18 @@ pub fn run() {
     let mut symbol_cache: HashMap<u64, String> = HashMap::new();
 
     loop {
+        if crate::writer_should_stop() {
+            crate::mark_writer_stopped();
+            return;
+        }
         symbol_cache.clear();
 
         // ── Connect ─────────────────────────────────────────────────────────
         let mut pipe = loop {
+            if crate::writer_should_stop() {
+                crate::mark_writer_stopped();
+                return;
+            }
             match OpenOptions::new().read(true).write(true).open(PIPE_PATH) {
                 Ok(f) => break BufWriter::new(f),
                 Err(_) => thread::sleep(RETRY_SLEEP),
@@ -98,6 +106,10 @@ pub fn run() {
                 batch.clear();
                 last_flush = Instant::now();
             } else {
+                if crate::writer_should_stop() {
+                    crate::mark_writer_stopped();
+                    return;
+                }
                 thread::sleep(POLL_SLEEP);
             }
         }
