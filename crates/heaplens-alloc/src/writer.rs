@@ -107,23 +107,52 @@ pub fn run() {
 }
 
 /// Prefixes of resolved symbol names that belong to the shared allocation
-/// instrumentation chain (this crate, the backtrace walker, and the std/core
-/// allocator internals) rather than genuine caller code. These are always
+/// instrumentation chain, or to the standard library's own allocation
+/// plumbing, rather than genuine caller code. These are always
 /// fully-qualified crate paths, so a leading-prefix match is correct.
-/// Extending or reordering this list does not affect the wire format or the
-/// hot path — classification happens here, in the writer, off the
-/// producer's critical path, and is shipped once per newly-seen address via
-/// the SYMBOLS frame.
+///
+/// **Design principle, not an accreted list of specific method names.**
+/// The classifier's job is: given a captured frame, is this frame part of
+/// the machinery *between* the allocator sink and the user's actual call
+/// site, or is it the user's call site? Every function inside the `alloc`
+/// crate is machinery by construction — it is the standard library's own
+/// allocation implementation (`Vec`, `Box`, `String`, `raw_vec`, `slice`,
+/// the `alloc`/`alloc_zeroed`/`realloc` entry points themselves), never
+/// user code, regardless of which specific method is called
+/// (`Vec::with_capacity` is exactly as much machinery as `vec![]`'s
+/// `from_elem` path — both are frames the user's code passes *through* on
+/// the way to the heap, not frames the user wrote). The bare `"alloc::"`
+/// prefix (matched with the trailing `::`, never as a bare substring)
+/// covers the whole crate in one rule instead of naming each container
+/// type's constructor individually — the previous version of this list
+/// named `alloc::vec::from_elem`/`spec_from_elem` specifically (the
+/// zeroed-`vec![]` path) but missed `alloc::vec::Vec::with_capacity` (a
+/// different, equally-machinery path through the same crate), which broke
+/// φ's root-attribution for any container built via `Vec::with_capacity`
+/// instead of `vec![]` — confirmed via `wire_producer`'s `items:
+/// Vec::with_capacity(100)` resolving its own effective site to
+/// `alloc::vec::Vec::<T>::with_capacity` instead of `wire_producer::main`,
+/// which then could never match any child's search set (computed by the
+/// same skip-machinery rule, but never containing that literal frame name
+/// as an ancestor). `std::collections::` is the same principle applied to
+/// `HashMap`/`BTreeMap`/`VecDeque` and friends, which wrap `alloc`
+/// internally under their own `std::collections::` module path rather
+/// than surfacing as `alloc::` frames directly.
+///
+/// A bare crate-name prefix like this is only safe because it is matched
+/// with the trailing `::` against a fully-qualified path — `"alloc::"`
+/// cannot match `myapp::allocate_buffer` (that starts with `"myapp::"`),
+/// and `"std::collections::"` cannot match `myapp::collections::Foo`. See
+/// the false-positive guard tests below; extending this list to a new
+/// stdlib namespace should always add a matching guard for the nearest
+/// plausible user-code collision.
 const MACHINERY_PREFIXES: &[&str] = &[
     "heaplens_alloc::",
     "backtrace::",
-    "alloc::alloc::",
-    "alloc::raw_vec::",
-    "alloc::vec::from_elem",
-    "alloc::vec::spec_from_elem",
-    "alloc::slice::",
+    "alloc::",
     "core::alloc::",
     "core::ptr::drop_in_place",
+    "std::collections::",
 ];
 
 /// Compiler-generated `__rust_alloc`/`__rust_dealloc`/`__rust_realloc`/
@@ -204,6 +233,39 @@ mod tests {
         assert!(!is_machinery_symbol("myapp::allocate_buffer"));
         assert!(!is_machinery_symbol("myapp::Allocator::new"));
         assert!(!is_machinery_symbol("myapp::reallocate_pool"));
+        // std::collections:: false-positive guard: a user module literally
+        // named "collections" must not collide with the stdlib prefix —
+        // the check requires the full "std::collections::" path, not a
+        // bare "collections" substring.
+        assert!(!is_machinery_symbol("myapp::collections::MyCollection::new"));
+        assert!(!is_machinery_symbol("collections::helpers::build"));
+    }
+
+    /// Regression for the `Vec::with_capacity` bug: `MACHINERY_PREFIXES`
+    /// previously named `alloc::vec::from_elem`/`spec_from_elem`
+    /// specifically (the `vec![]` zeroed-alloc path) but missed
+    /// `alloc::vec::Vec::with_capacity` — an equally-machinery path through
+    /// the same `alloc` crate, just a different constructor. That gap made
+    /// any container built via `Vec::with_capacity` (rather than `vec![]`)
+    /// resolve its own effective site to the stdlib frame instead of the
+    /// user's enclosing function, breaking φ's root-attribution for it.
+    /// The fix widens the check to the whole `alloc` crate as one rule
+    /// (see `MACHINERY_PREFIXES`'s doc comment) rather than naming
+    /// container constructors one at a time — this test asserts several
+    /// stdlib allocation idioms all classify as machinery under that rule,
+    /// specifically so the *next* idiom (not listed here) is covered by
+    /// construction rather than requiring another bug report to add it.
+    #[test]
+    fn classifies_stdlib_container_constructors_as_machinery_not_just_vec_from_elem() {
+        assert!(is_machinery_symbol(
+            "alloc::vec::Vec<tuple$<alloc::vec::Vec<u8>,alloc::vec::Vec<u8> > >::with_capacity<tuple$<alloc::vec::Vec<u8>,alloc::vec::Vec<u8> > >"
+        ));
+        assert!(is_machinery_symbol("alloc::vec::Vec<u8>::from_iter<alloc::vec::IntoIter<u8>>"));
+        assert!(is_machinery_symbol("alloc::boxed::Box<u8>::new"));
+        assert!(is_machinery_symbol("alloc::string::String::with_capacity"));
+        assert!(is_machinery_symbol(
+            "std::collections::hash::map::HashMap<alloc::string::String,u32>::with_capacity"
+        ));
     }
 
     #[test]
