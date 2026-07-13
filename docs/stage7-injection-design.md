@@ -16,11 +16,42 @@ explicitly out of scope here — see §3.4.
 
 ## 1. Capture front-end
 
-### 1.1 Mechanism: inline hooking via `minhook`, on the `HeapAlloc` layer
+### 1.1 Mechanism: inline hooking via `minhook`, on the `ntdll!Rtl*Heap` layer
 
 **Chosen:** a hook DLL installs inline (trampoline) hooks on
-`HeapAlloc` / `HeapReAlloc` / `HeapFree` (kernelbase/kernel32), using the
+`ntdll!RtlAllocateHeap` / `RtlReAllocateHeap` / `RtlFreeHeap`, using the
 `minhook` crate (Rust bindings to the MinHook library).
+
+**Revised from the initial draft, which specified `kernelbase!HeapAlloc` —
+confirmed during Step 1 implementation to be the wrong layer on this
+system, not a style choice.** Hooking `kernelbase!HeapAlloc`/`HeapReAlloc`/
+`HeapFree` directly produced a reproducible `STATUS_ACCESS_VIOLATION` on
+the very first call after `MinHook::enable_all_hooks()` succeeded — MinHook
+reports success at every step (hook creation, enable), but the generated
+trampoline is broken the instant it's invoked. Isolated via a control
+probe: hooking a simple, non-allocating export (`GetTickCount`) with the
+identical create/enable/detour pattern worked correctly (correct trampoline
+call, correct return value, no crash), which rules out a usage mistake and
+narrows the failure to something specific about `HeapAlloc`'s prologue
+shape on this Windows build. Hooking one layer lower, at
+`ntdll!RtlAllocateHeap` (which `kernelbase!HeapAlloc` is a thin wrapper
+around), is stable — confirmed via the same control-probe method, then via
+the full Step 1 acceptance gate.
+
+**Consequence, not a downside to hide:** `Rtl*Heap` is lower-level and
+process-wide — it intercepts *all* heap traffic through that path,
+including allocations `HeapAlloc`-layer hooking wouldn't have surfaced
+identically, and including the capture pipeline's own ambient heap traffic
+(the writer thread's pipe I/O triggers some Windows-internal heap calls as
+a side effect — confirmed empirically, see §8 Step 1's acceptance gate,
+which matches captured events to the workload by pointer identity rather
+than a raw count specifically because of this). This is a more honest
+capture surface than the `HeapAlloc` layer would have been, not a worse
+one — the same "silent undercount is worse than a visible one" reasoning
+below for IAT-vs-inline hooking applies here too. Any real deployment
+built on this design must filter/attribute by pointer identity or
+equivalent, not assume the raw event stream is 1:1 with "the target's own
+calls," because it structurally is not.
 
 **Why not IAT hooking:** IAT hooking only intercepts calls that go through
 the target's import table. It misses statically-linked CRTs (every MSVC
@@ -34,15 +65,16 @@ Inline hooking intercepts the function at its entry point regardless of how
 control reached it, which is the only mechanism that gives an honest capture
 surface on binaries we don't control.
 
-**Why the `HeapAlloc` layer, not CRT `malloc`:** CRT `malloc` calls
-`HeapAlloc` internally on Windows. Hooking both would double-count every CRT
-allocation. `HeapAlloc`/`HeapReAlloc`/`HeapFree` is the common sink — it
-catches CRT-backed allocations *and* direct-Win32 allocators that bypass the
-CRT entirely, and avoids per-CRT-version `malloc` symbol variance (static vs
-dynamic CRT, debug vs release CRT naming). The tradeoff: this observes heap
-*operations*, not CRT-level semantics (e.g. `calloc`'s zeroing is invisible
-as a distinct operation from a plain alloc). That's acceptable — HeapLens is
-a memory-topology tool, not a CRT-semantics tool.
+**Why the `Rtl*Heap` layer, not CRT `malloc`:** CRT `malloc` calls into this
+same layer internally on Windows. Hooking both would double-count every CRT
+allocation. `RtlAllocateHeap`/`RtlReAllocateHeap`/`RtlFreeHeap` is the
+common sink — it catches CRT-backed allocations *and* direct-Win32
+allocators that bypass the CRT entirely, and avoids per-CRT-version
+`malloc` symbol variance (static vs dynamic CRT, debug vs release CRT
+naming). The tradeoff: this observes heap *operations*, not CRT-level
+semantics (e.g. `calloc`'s zeroing is invisible as a distinct operation
+from a plain alloc). That's acceptable — HeapLens is a memory-topology
+tool, not a CRT-semantics tool.
 
 ### 1.2 Wire format and transport: unchanged, reused as-is
 
@@ -76,16 +108,50 @@ bytes a cooperative producer already produces.
 - **`heaplens-hook`** (new crate, `cdylib`) — the DLL that gets injected.
   Statically links `minhook` and reuses the existing `heaplens-alloc`
   capture pipeline as a library: the lock-free per-thread ring buffer
-  (`ring.rs`), the background writer thread, symbol resolution, and pipe
-  framing are **reused unmodified in spirit** — only the *entry point*
-  differs. Where `heaplens-alloc` hangs off `#[global_allocator]` (a
-  compile-time hook available only to a statically-linked producer),
-  `heaplens-hook` hangs the same capture call off MinHook-installed
-  trampolines on `HeapAlloc`/`HeapReAlloc`/`HeapFree`. This is the precise
-  boundary of what's reusable: **the capture pipeline is shared code; the
-  interception mechanism is new, because compile-time and inject-time
-  interception are fundamentally different hooks into fundamentally
-  different points in the allocator's lifecycle.**
+  (`ring.rs`), the record/capture/writer functions, symbol resolution, and
+  pipe framing are the same code, now exposed as `pub` for this reuse.
+  Where `heaplens-alloc` hangs off `#[global_allocator]` (a compile-time
+  hook available only to a statically-linked producer), `heaplens-hook`
+  hangs the same `record()` call off MinHook-installed trampolines on
+  `RtlAllocateHeap`/`RtlReAllocateHeap`/`RtlFreeHeap` (§1.1). The capture
+  logic itself — ring push, event construction, stack capture, wire framing
+  — is unmodified.
+
+  **Revised from the initial draft's "reused unmodified in spirit" —
+  confirmed during Step 1 that the *lifecycle*, not just the entry point,
+  differs, and the difference is load-bearing, not stylistic.**
+  `heaplens-alloc`'s cooperative model spins up the writer thread and
+  primes symbol resolution *lazily*, triggered by the first captured
+  event — safe there because record() runs on an ordinary thread making an
+  ordinary allocation. Inside an injected hook, that same lazy trigger runs
+  *from inside the hook callback itself*, and two distinct, empirically
+  confirmed hazards follow from that: spawning a thread from inside the
+  hook reenters the not-yet-stable hooked path during the new thread's
+  `DLL_THREAD_ATTACH` bootstrap (crash), and the writer thread's first
+  `backtrace::resolve` call — which loads and initializes `dbghelp.dll` —
+  hits the same class of hazard one layer later (also a crash, isolated by
+  disabling one thing at a time until each specific cause was found). Both
+  are fixed the same way: force them to completion *eagerly*, before any
+  hook is installed. `HeapLensHookAttach` therefore performs, in this exact
+  order:
+  1. Create the private heap (§4.2).
+  2. Start the writer thread (`heaplens_alloc::ensure_writer_started`).
+  3. Warm `backtrace::resolve`'s one-time init
+     (`heaplens_alloc::warm_up_symbol_resolution`).
+  4. **Only then** install and enable the MinHook hooks.
+
+  This ordering is a hard requirement, not an optimization — reverting to
+  lazy initialization "to simplify" would reintroduce a target-crashing bug
+  invisible to any test run in a warm process (a test harness that already
+  triggered dbghelp/thread-pool warmup elsewhere wouldn't reproduce it). A
+  fourth hazard, symmetric to the first, governs detach and is covered in
+  §4.1.
+
+  **The precise, now-corrected boundary of what's reusable:** the capture
+  *logic* (ring, record, writer body, wire framing) is shared code,
+  unmodified. The *lifecycle* — when each piece is allowed to initialize
+  relative to when hooks are live — is new and specific to injection, not
+  a stylistic difference from the cooperative allocator's lifecycle.
 
 - **`heaplens-injector`** (new crate, small synchronous binary) — does the
   actual `OpenProcess` / `VirtualAllocEx` / `WriteProcessMemory` /
@@ -313,10 +379,42 @@ creation / pipe connection all need to run outside it). Instead,
    created, and the pipe connection is opened. All real work happens here,
    safely outside the loader lock.
 
-Detach is symmetric: `heaplens-injector --detach` calls
-`HeapLensHookDetach` via `CreateRemoteThread` (disables and removes the
-MinHook hooks, stops the writer thread, closes the pipe connection, frees
-the private heap), then a final `CreateRemoteThread` calling
+**`HeapLensHookAttach`'s internal ordering is a hard requirement, confirmed
+empirically (§1.3), not an implementation detail:** private heap, then
+start the writer thread, then warm `backtrace::resolve`'s one-time init,
+then — only then — install and enable the MinHook hooks. Each of the first
+three must complete on this normal thread *before* any hook exists for a
+callback to reenter.
+
+**Detach's ordering is the reverse, and equally load-bearing — confirmed
+empirically as a fourth, distinct hazard, symmetric to the two above.**
+Even with hooks correctly disabled and both attach-time hazards fixed, a
+target still crashed if the writer thread was left running through
+process/DLL teardown: a thread *exiting* naturally also triggers
+`DLL_THREAD_DETACH` notifications and TLS-destructor cleanup on that
+thread, which itself performs heap operations — if hooks are still active
+at that moment, those exit-time heap calls route through the detour during
+the exact window the thread is mid-teardown. `HeapLensHookDetach` therefore
+performs, in this exact order:
+
+1. `MinHook::disable_all_hooks` — un-redirects the three hooked functions
+   (but does not yet free MinHook's trampolines, so the private-heap
+   allocator, still in use by the writer thread until it actually stops,
+   keeps working correctly through this window).
+2. Signal the writer thread to stop and wait, bounded by a timeout, for it
+   to actually exit (`heaplens_alloc::request_writer_stop_and_wait`). Its
+   own exit-time heap traffic now goes through the real, unhooked
+   functions, not a detour — this is *why* step 1 must happen first, not
+   an independent nicety.
+3. Only once the writer is confirmed stopped: `MinHook::uninitialize`
+   (frees the trampolines) and destroy the private heap.
+
+If the writer does not stop within the timeout, detach does **not**
+proceed to steps 3 — freeing MinHook's trampolines or the private heap out
+from under a thread that may still be executing code depending on either
+is worse than leaving the hook installed. `heaplens-injector --detach`
+then calls `HeapLensHookDetach` via `CreateRemoteThread`, and — once it
+returns success — a final `CreateRemoteThread` calling
 `FreeLibraryAndExitThread` to unload the DLL from the target. After detach
 completes, the target process is left exactly as if `heaplens-hook.dll` had
 never been loaded — no dangling hooks, no leftover threads.
@@ -324,17 +422,18 @@ never been loaded — no dangling hooks, no leftover threads.
 ### 4.2 Reentrancy inside the hook
 
 The hook functions run **inside the target's own threads**, at the moment
-they call `HeapAlloc`/`HeapFree`. If capturing an event itself allocates —
-building the `AllocEvent`, growing a buffer, opening a pipe — that
-allocation re-enters the hooked `HeapAlloc`, which re-enters the capture
-code: unbounded recursion, crashing the target. This is the same hazard
-Stage 2's cooperative allocator solved with a thread-local reentrancy guard
-(`heaplens-alloc/src/guard.rs`) — `heaplens-hook` uses the identical
-pattern, now load-bearing in a context where a crash means crashing
-*someone else's process*, not our own test binary:
+they call `RtlAllocateHeap`/`RtlFreeHeap`/`RtlReAllocateHeap` (§1.1). If
+capturing an event itself allocates — building the `AllocEvent`, growing a
+buffer, opening a pipe — that allocation re-enters the hooked function,
+which re-enters the capture code: unbounded recursion, crashing the
+target. This is the same hazard Stage 2's cooperative allocator solved
+with a thread-local reentrancy guard (`heaplens-alloc/src/guard.rs`) —
+`heaplens-hook` uses the identical pattern, now load-bearing in a context
+where a crash means crashing *someone else's process*, not our own test
+binary:
 
 - A thread-local guard flag: if already inside the hook on this thread,
-  call straight through to the real `HeapAlloc` (via the MinHook trampoline)
+  call straight through to the real function (via the MinHook trampoline)
   and do not attempt to capture.
 - All of the hook's own memory needs (event staging buffer, ring buffer
   storage) come from a **private heap** created once at attach time via
@@ -569,12 +668,24 @@ harness process that statically links nothing but calls
 This isolates "does the hook itself work" from "does injection work,"
 which are separable concerns and should not be debugged simultaneously.
 
-Covers: MinHook installation on `HeapAlloc`/`HeapReAlloc`/`HeapFree`,
-thread-local reentrancy guard, private heap for internal allocations, ring
-buffer + writer thread (reused from `heaplens-alloc`), pipe connection,
-`Handshake` with real `pid`, event framing, clock rebased to attach-time,
-`HeapLensHookDetach` cleanly uninstalling hooks and stopping the writer
-thread.
+Covers: MinHook installation on `RtlAllocateHeap`/`RtlReAllocateHeap`/
+`RtlFreeHeap` (§1.1), thread-local reentrancy guard, private heap for
+internal allocations, ring buffer + writer thread (reused from
+`heaplens-alloc`), eager writer-start/symbol-resolution warm-up before
+hooks go live (§1.3), pipe connection, `Handshake` with real `pid`, event
+framing, clock rebased to attach-time, `HeapLensHookDetach` disabling
+hooks before stopping the writer and cleanly uninstalling everything
+(§4.1).
+
+**Done — complete, per the design as revised above (`dev/phase_7`
+commit `b3a22c2`).** One methodology refinement versus this section's
+original plan: the gate matches captured events to the workload by
+*pointer identity*, not a raw global count as first specified — the
+`Rtl*Heap` hook layer (§1.1) intercepts ambient, expected Windows-internal
+heap traffic alongside the workload's own calls, so a raw count is not, in
+fact, exact-comparable; identity matching isolates workload correctness
+from that noise. See §1.1 for why this layer was chosen over the
+originally-planned `HeapAlloc` layer.
 
 **Acceptance gate — must assert correctness, not just "it ran."** A gate
 that only confirms the DLL loads and doesn't crash would pass with a
