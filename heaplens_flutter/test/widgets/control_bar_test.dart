@@ -1,13 +1,16 @@
 import 'dart:async';
+import 'dart:convert';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:heaplens_flutter/models/control.dart';
 import 'package:heaplens_flutter/models/graph_diff.dart';
 import 'package:heaplens_flutter/models/node.dart';
 import 'package:heaplens_flutter/providers/filter_providers.dart';
 import 'package:heaplens_flutter/providers/graph_provider.dart';
 import 'package:heaplens_flutter/providers/paused_provider.dart';
+import 'package:heaplens_flutter/providers/target_provider.dart';
 import 'package:heaplens_flutter/providers/view_mode_provider.dart';
 import 'package:heaplens_flutter/providers/ws_provider.dart';
 import 'package:heaplens_flutter/widgets/control_bar.dart';
@@ -36,13 +39,23 @@ NodeDto _node({
 
 Future<ProviderContainer> _pumpControlBar(
   WidgetTester tester,
-  StreamController<GraphMessage> controller,
-) async {
+  StreamController<GraphMessage> controller, {
+  List<Override> extraOverrides = const [],
+}) async {
   late ProviderContainer container;
   await tester.pumpWidget(
     ProviderScope(
       overrides: [
         graphMessageProvider.overrideWith((ref) => controller.stream),
+        // ControlBar unconditionally `ref.listen`s controlResponseProvider
+        // (Stage 7 §4.4's target-exit banner) — which builds it even when a
+        // test doesn't care about it. Left unoverridden, that would build
+        // the *real* provider and open a real WebSocket connection attempt
+        // during every test in this file. An empty, never-emitting stream
+        // is a safe default; tests that do care override it themselves via
+        // extraOverrides.
+        controlResponseProvider.overrideWith((ref) => const Stream.empty()),
+        ...extraOverrides,
       ],
       child: Consumer(
         builder: (context, ref, _) {
@@ -192,5 +205,78 @@ void main() {
     await tester.pump();
 
     expect(container.read(symbolSearchFilterProvider), 'alloc::vec');
+  });
+
+  group('attach/detach control (Stage 7 §3/Step 4)', () {
+    testWidgets('shows "Attach to Process…" when nothing is attached', (tester) async {
+      final controller = StreamController<GraphMessage>();
+      addTearDown(() => controller.close());
+      await _pumpControlBar(tester, controller);
+
+      expect(find.byKey(const Key('attachButton')), findsOneWidget);
+      expect(find.byKey(const Key('detachButton')), findsNothing);
+    });
+
+    testWidgets('shows the attached target\'s name/pid and a Detach button once attached',
+        (tester) async {
+      final controller = StreamController<GraphMessage>();
+      addTearDown(() => controller.close());
+      final container = await _pumpControlBar(tester, controller);
+
+      container.read(attachedTargetProvider.notifier).setAttached(
+            const AttachedTarget(pid: 4242, name: 'target.exe'),
+          );
+      await tester.pump();
+
+      expect(find.byKey(const Key('attachButton')), findsNothing);
+      expect(find.byKey(const Key('attachedTargetLabel')), findsOneWidget);
+      expect(find.text('target.exe (pid 4242)'), findsOneWidget);
+      expect(find.byKey(const Key('detachButton')), findsOneWidget);
+    });
+
+    testWidgets('tapping Detach sends DetachTargetRequest and clears the attached target',
+        (tester) async {
+      final controller = StreamController<GraphMessage>();
+      addTearDown(() => controller.close());
+      final sent = <String>[];
+      // A never-closing stream, not `Stream.empty()` — an empty stream
+      // completes (fires `onDone`) as soon as it's listened to, which would
+      // immediately trigger GraphMessageConnection's reconnect path and
+      // clear the very `_sendCurrent` this test needs `sendRequest` to
+      // forward through, before the tap below ever happens.
+      final neverCloses = StreamController<dynamic>();
+      addTearDown(neverCloses.close);
+      final fakeConnection = GraphMessageConnection(
+        connector: () => WsFrames(neverCloses.stream, () {}, sent.add),
+        backoff: (_) => Duration.zero,
+        onStatus: (_) {},
+        onMessage: (_) {},
+        onError: (e, st) {},
+      );
+      fakeConnection.start();
+      addTearDown(fakeConnection.dispose);
+
+      final container = await _pumpControlBar(
+        tester,
+        controller,
+        extraOverrides: [
+          wsConnectionProvider.overrideWithValue(fakeConnection),
+        ],
+      );
+
+      container.read(attachedTargetProvider.notifier).setAttached(
+            const AttachedTarget(pid: 4242, name: 'target.exe'),
+          );
+      await tester.pump();
+
+      await tester.tap(find.byKey(const Key('detachButton')));
+      await tester.pump();
+
+      expect(sent, [jsonEncode(const DetachTargetRequest().toJson())]);
+      // Detach is optimistic client-side (target_provider.dart's doc) — the
+      // attached target clears immediately, before any daemon reply.
+      expect(container.read(attachedTargetProvider), isNull);
+      expect(find.byKey(const Key('attachButton')), findsOneWidget);
+    });
   });
 }

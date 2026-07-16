@@ -1,11 +1,14 @@
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
+import '../models/control.dart';
 import '../providers/filter_providers.dart';
 import '../providers/graph_provider.dart';
 import '../providers/paused_provider.dart';
+import '../providers/target_provider.dart';
 import '../providers/view_mode_provider.dart';
 import '../providers/ws_provider.dart';
+import 'process_picker_dialog.dart';
 
 /// Colors for each [ConnectionStatus], used for the small status dot.
 const Map<ConnectionStatus, Color> kConnectionStatusColors = {
@@ -45,6 +48,20 @@ class ControlBar extends ConsumerWidget {
     final viewMode = ref.watch(viewModeProvider);
     final minSize = ref.watch(minSizeFilterProvider);
     final orphanOnly = ref.watch(orphanOnlyFilterProvider);
+    final attached = ref.watch(attachedTargetProvider);
+
+    // Stage 7 §4.4: surface target-exit as a legible, one-time banner
+    // rather than a silent state change — the graph itself doesn't visibly
+    // announce "the target that was producing these nodes is gone."
+    ref.listen<AsyncValue<ControlResponse>>(controlResponseProvider, (previous, next) {
+      next.whenData((resp) {
+        if (resp is TargetExitedResponse) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Target process (pid ${resp.pid}) exited')),
+          );
+        }
+      });
+    });
 
     return Material(
       color: const Color(0xFF1E1E1E),
@@ -56,6 +73,7 @@ class ControlBar extends ConsumerWidget {
           crossAxisAlignment: WrapCrossAlignment.center,
           children: [
             _ConnectionIndicator(status: status),
+            _AttachControl(attached: attached, ref: ref),
             _Counter(label: 'Nodes', value: '${notifier.liveNodeCount}'),
             _Counter(label: 'Orphans', value: '${notifier.orphanCount}'),
             _Counter(label: 'Bytes', value: '${notifier.totalLiveBytes}'),
@@ -162,6 +180,48 @@ class _ConnectionIndicator extends StatelessWidget {
         Text(
           kConnectionStatusLabels[status]!,
           style: const TextStyle(color: Colors.white70),
+        ),
+      ],
+    );
+  }
+}
+
+/// "Attach to Process…" button when nothing is attached, or the attached
+/// target's name/pid plus a Detach button when one is. Stage 7 §3/Step 4.
+class _AttachControl extends StatelessWidget {
+  const _AttachControl({required this.attached, required this.ref});
+
+  final AttachedTarget? attached;
+  final WidgetRef ref;
+
+  @override
+  Widget build(BuildContext context) {
+    final attached = this.attached;
+    if (attached == null) {
+      return ElevatedButton.icon(
+        key: const Key('attachButton'),
+        icon: const Icon(Icons.link),
+        label: const Text('Attach to Process…'),
+        onPressed: () => showProcessPickerDialog(context),
+      );
+    }
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Text(
+          key: const Key('attachedTargetLabel'),
+          '${attached.name} (pid ${attached.pid})',
+          style: const TextStyle(color: Colors.white70),
+        ),
+        const SizedBox(width: 6),
+        IconButton(
+          key: const Key('detachButton'),
+          tooltip: 'Detach',
+          icon: const Icon(Icons.link_off),
+          onPressed: () {
+            ref.read(wsConnectionProvider).sendRequest(const DetachTargetRequest());
+            ref.read(attachedTargetProvider.notifier).clear();
+          },
         ),
       ],
     );

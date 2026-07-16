@@ -1,21 +1,28 @@
 //! Stage 7 capture front-end for injected (uncooperative) processes.
 //!
 //! Loaded into a target process by `heaplens-injector` and driven via the
-//! two exported entry points below — never from `DllMain`, per
+//! exported entry points below — never from `DllMain`, per
 //! `docs/stage7-injection-design.md` §4.1 (loader-lock deadlock hazard).
-//! `HeapLensHookAttach` installs MinHook trampolines on
-//! `HeapAlloc`/`HeapReAlloc`/`HeapFree` and drives the same capture
-//! pipeline (`heaplens_alloc::record`, the ring buffer, the writer thread)
-//! that the cooperative `#[global_allocator]` producer uses — only the
-//! interception mechanism differs. `HeapLensHookDetach` removes the hooks
-//! and leaves the target exactly as if this DLL had never loaded.
+//! `HeapLensHookAttach`/`HeapLensHookAttachRemote` install MinHook
+//! trampolines on `RtlAllocateHeap`/`RtlReAllocateHeap`/`RtlFreeHeap` and
+//! drive the same capture pipeline (`heaplens_alloc::record`, the ring
+//! buffer, the writer thread) that the cooperative `#[global_allocator]`
+//! producer uses — only the interception mechanism differs. Two attach
+//! entry points exist (rather than one) because a raw `CreateRemoteThread`
+//! thread and a normal in-process thread have different constraints on how
+//! they may safely return — see `HeapLensHookAttachRemote`'s doc comment.
+//! `HeapLensHookDetach` (in-process callers) and `HeapLensHookDetachApc`
+//! (the `QueueUserAPC`-driven path `heaplens-injector` actually uses, see
+//! `WORKER_TID`'s doc comment) both remove the hooks and leave the target
+//! exactly as if this DLL had never loaded.
 
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicPtr, AtomicU32, Ordering};
 
 use minhook::MinHook;
 use windows_sys::Win32::Foundation::HANDLE;
 use windows_sys::Win32::System::Memory::{GetProcessHeap, HeapAlloc, HeapCreate, HeapDestroy, HeapFree, HeapReAlloc};
+use windows_sys::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadId, SleepEx, TerminateThread};
 
 use heaplens_protocol::EventKind;
 
@@ -35,6 +42,49 @@ static ORIG_HEAP_ALLOC: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut())
 static ORIG_HEAP_REALLOC: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 static ORIG_HEAP_FREE: AtomicPtr<c_void> = AtomicPtr::new(std::ptr::null_mut());
 static ATTACHED: AtomicBool = AtomicBool::new(false);
+
+// ── Cross-process detach handshake (§8 Step 2) ─────────────────────────
+//
+// `heaplens-injector` cannot safely run `HeapLensHookDetach` via a second
+// `CreateRemoteThread` call while hooks are active: creating that thread
+// at all — regardless of what code it runs — makes the OS deliver
+// `DLL_THREAD_ATTACH` to every loaded DLL on it (including `ucrtbase`'s own
+// per-thread setup) *before* our code gets control, and that notification's
+// own heap traffic reenters our still-active detour on a `CreateRemoteThread`
+// -created "raw" thread — the same class of stack-walk hazard documented on
+// `HeapLensHookAttach`'s own exit path, just at start instead of end.
+// Confirmed empirically: even a `HeapLensHookDetach` body reduced to an
+// immediate `return 42` (no spawn, no real work) still crashed identically
+// whenever hooks were active at the moment the injector's second
+// `CreateRemoteThread` call created the thread — proving the fault is in the
+// automatic notification, not anything this module's code does.
+//
+// The fix avoids creating a second raw thread at all: `attach_impl`'s own
+// worker thread (already alive, already a normal, properly CRT-initialized
+// Rust thread — safe by construction, unlike a `CreateRemoteThread` thread)
+// parks itself in an *alertable* wait instead of an inert one, and exposes
+// its OS thread ID here so `heaplens-injector` can `QueueUserAPC` detach
+// work directly onto it from outside the process — no new thread, so no
+// `DLL_THREAD_ATTACH` hazard. `HeapLensHookDetachApc` below is the queued
+// callback; `DETACH_RESULT` is how the injector (which cannot receive a
+// return value from a queued APC) reads the outcome back via
+// `ReadProcessMemory`, polling until it leaves its `-1` "pending" sentinel.
+#[unsafe(no_mangle)]
+pub static WORKER_TID: AtomicU32 = AtomicU32::new(0);
+#[unsafe(no_mangle)]
+pub static DETACH_RESULT: AtomicI32 = AtomicI32::new(-1);
+
+// A size no real caller would ever request, used to prove the trampoline
+// actually works end to end (real call -> detour invoked -> real function
+// executed -> detour returns the correct result) before trusting the hook
+// with a real target. MinHook reporting "enable succeeded" is not
+// sufficient evidence on its own — that is exactly the failure mode found
+// hooking the kernelbase!HeapAlloc layer (§1.1): every install/enable step
+// reported success while the generated trampoline was broken, and the
+// first real call after enable crashed. See `HeapLensHookAttach`'s canary
+// check, run once per attach, before any real capture is trusted.
+const CANARY_SIZE: usize = 0xC0FFEE;
+static CANARY_HIT: AtomicBool = AtomicBool::new(false);
 
 type HeapAllocFn = unsafe extern "system" fn(HANDLE, u32, usize) -> *mut c_void;
 type HeapReAllocFn = unsafe extern "system" fn(HANDLE, u32, *const c_void, usize) -> *mut c_void;
@@ -106,6 +156,13 @@ unsafe extern "system" fn hook_heap_alloc(hheap: HANDLE, dwflags: u32, dwbytes: 
     let trampoline = ORIG_HEAP_ALLOC.load(Ordering::Acquire);
     let real: HeapAllocFn = unsafe { std::mem::transmute(trampoline) };
     let ptr = unsafe { real(hheap, dwflags, dwbytes) };
+    if dwbytes == CANARY_SIZE {
+        // The attach-time canary (below): proves this detour actually ran
+        // and the trampoline actually produced a real allocation. Not a
+        // real event — never recorded, so it never reaches the wire.
+        CANARY_HIT.store(true, Ordering::Release);
+        return ptr;
+    }
     if !ptr.is_null() {
         heaplens_alloc::record(EventKind::Alloc, ptr as u64, 0, dwbytes as u64, 0);
     }
@@ -145,10 +202,151 @@ unsafe extern "system" fn hook_heap_free(hheap: HANDLE, dwflags: u32, lpmem: *co
 // Called via a second `CreateRemoteThread`, after `LoadLibraryW` has
 // already loaded this DLL and returned — never from `DllMain`, so none of
 // this runs under the loader lock.
+//
+// **Both exported functions are thin shims — real work never runs directly
+// on the thread `CreateRemoteThread` created.** Confirmed empirically as a
+// fifth, distinct hazard (Step 2): calling `HeapLensHookAttach`'s real body
+// directly via `CreateRemoteThread` crashed (`STATUS_STACK_BUFFER_OVERRUN`,
+// the same fastfail signature observed for the writer-thread hazards)
+// even though the identical code, called via `GetProcAddress` + a direct
+// function call *within* the same process (Step 1's self-load harness),
+// worked correctly. Root cause: Rust's runtime assumes threads are created
+// through its own path (ultimately the CRT's `_beginthreadex`), which
+// performs per-thread setup — a properly sized/guarded stack, TLS
+// bookkeeping — that a bare `CreateRemoteThread` thread never receives.
+// Running MinHook calls, private-heap creation, and the writer/canary
+// logic directly on such a thread is exactly the kind of substantial,
+// assumption-laden work that hazard breaks. The fix is the standard
+// mitigation: the exported function does only `std::thread::spawn` (a
+// *real*, properly-initialized Rust thread) and blocks on `join()` for the
+// result — all the real logic runs on that spawned thread, never on the
+// raw `CreateRemoteThread` thread itself.
 
 /// Returns 0 on success, a nonzero failure code otherwise.
+///
+/// **Confirmed empirically as a sixth, distinct hazard** — the spawned
+/// worker thread's *own natural exit* crashed even after `attach_impl`'s
+/// entire body completed successfully (traced via diagnostics: every step
+/// up to and including a successful canary check printed, yet the
+/// injector still reported an access violation). Root cause: a thread
+/// exiting triggers `DLL_THREAD_DETACH`/TLS cleanup on that thread, the
+/// same hazard class as `ensure_writer`/`request_writer_stop_and_wait` —
+/// except there the fix was "disable hooks before the thread is allowed to
+/// exit." That fix does not apply here: a *successful* attach must leave
+/// hooks active on return, so the worker thread cannot disable them before
+/// exiting without undoing the whole point of attaching. The only
+/// remaining option is to never let this thread exit at all: it sends its
+/// result back over a channel, then waits forever rather than returning.
+/// One permanently-parked thread per attach is an acceptable, one-time
+/// cost, cleaned up naturally when the DLL is eventually unloaded.
+///
+/// It waits *alertably* (`SleepEx(INFINITE, TRUE)`), not via
+/// `std::thread::park()` — see `WORKER_TID`'s doc comment above: this same
+/// thread is later reused, via `QueueUserAPC`, to run detach's real work,
+/// specifically to avoid creating a second `CreateRemoteThread`-spawned raw
+/// thread while hooks are active.
+/// Shared core: spawns the worker thread, records its TID (for detach's
+/// later `QueueUserAPC`, see `WORKER_TID`'s doc comment), and blocks for its
+/// result. Common to both exported entry points below — they differ only in
+/// how the *calling* thread is allowed to return afterward.
+fn attach_and_wait() -> u32 {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let spawned = std::thread::Builder::new().spawn(move || {
+        WORKER_TID.store(unsafe { GetCurrentThreadId() }, Ordering::Release);
+        let rc = attach_impl();
+        let _ = tx.send(rc);
+        loop {
+            unsafe { SleepEx(u32::MAX, 1) };
+        }
+    });
+    if spawned.is_err() {
+        return u32::MAX;
+    }
+    rx.recv().unwrap_or(u32::MAX)
+}
+
+/// Direct, in-process entry point: call this from a normal thread (e.g. a
+/// self-load harness's own `main`) that is safe to simply return from
+/// afterward. **Must not be used as a `CreateRemoteThread` start routine**
+/// — see `HeapLensHookAttachRemote` below for that case; calling *this* one
+/// via `CreateRemoteThread` would leave hooks active and then let that raw
+/// thread return normally, reintroducing the ninth hazard `Remote` exists
+/// to avoid.
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn HeapLensHookAttach() -> u32 {
+    attach_and_wait()
+}
+
+/// `CreateRemoteThread`-safe entry point: identical work to
+/// `HeapLensHookAttach`, but the calling thread never returns normally
+/// afterward.
+///
+/// A ninth, distinct hazard, found after the eighth's fix
+/// (`force_enter_permanent`) failed to resolve an identical crash on this
+/// path: diagnostics showed every one of this thread's own post-return heap
+/// frees correctly suppressed by the guard (no `capture_stack` ever
+/// attempted) — yet the process still crashed with the same
+/// `STATUS_STACK_BUFFER_OVERRUN` signature. So the fault is not in anything
+/// `record()` does; it is in the mere act of *returning* from this function
+/// at all. A normal return from a `CreateRemoteThread` start routine makes
+/// the OS call `ExitThread`, which synchronously delivers
+/// `DLL_THREAD_DETACH` to every loaded DLL on this thread before it
+/// actually dies — unconditionally, regardless of what our own code does or
+/// guards. That notification runs deep inside `ntdll`'s own thread-shutdown
+/// path, a calling context this thread (created by raw `CreateRemoteThread`,
+/// never touched by the CRT's own thread-init path) is not equipped for;
+/// something in that path performs a heap operation that reenters our still
+/// -active detour at a point with insufficient stack margin, corrupting it
+/// (the fault code is a `/GS` stack-cookie mismatch, not a generic access
+/// violation — consistent with an actual overrun, not just "unsafe to
+/// walk"). Guarding what *our* code does downstream cannot fix a fault that
+/// happens in the OS's own unavoidable teardown sequence.
+///
+/// The fix is architectural, not another point patch: never let this thread
+/// reach that teardown sequence at all. `TerminateThread` on the calling
+/// thread itself is explicitly documented to skip `DLL_THREAD_DETACH`
+/// notification entirely (unlike a normal return or `ExitThread`) —
+/// normally a liability (leaked per-thread cleanup) but exactly the
+/// property needed here: this thread has done nothing but spawn the
+/// worker, wait for its result, and mark itself permanently guarded, so it
+/// owns no resources whose cleanup we need. Its exit code is set from
+/// `dwExitCode` exactly as a normal return would set it, so
+/// `heaplens-injector`'s `GetExitCodeThread` read is unaffected.
+///
+/// This must be a **separate** export from `HeapLensHookAttach`, not a
+/// flag/branch inside it: self-load's harness calls `HeapLensHookAttach`
+/// directly, in-process, on its own long-lived main thread — unconditional
+/// `TerminateThread` there kills that thread (and its still-pending
+/// workload) outright, which is exactly what broke `hook_self_load_wire`'s
+/// gate the first time this fix was applied to the shared function.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn HeapLensHookAttachRemote() -> u32 {
+    let result = attach_and_wait();
+    heaplens_alloc::guard::force_enter_permanent();
+    // SAFETY / DO NOT REORDER: this call is only lock-free because nothing
+    // between `attach_and_wait()` returning and this line touches a lock or
+    // the heap — see docs/stage7-injection-design.md §4.1 ("fifth hazard")
+    // for the full proof. `attach_and_wait()`'s `rx.recv()` has already
+    // *returned* (its `Receiver::drop` already ran, uninterrupted, as part
+    // of that normal return) and `force_enter_permanent()` is a
+    // `const`-initialized fast-TLS store with no allocation. If you add ANY
+    // code between the two lines above and this `TerminateThread` call —
+    // including something that looks allocation-free — re-verify the proof
+    // before assuming it still holds: `TerminateThread` skips all normal
+    // cleanup (no unwind, no Drop, no lock release), so anything left
+    // locked here stays locked for the rest of the target's process
+    // lifetime.
+    unsafe { TerminateThread(GetCurrentThread(), result) };
+    // Per Win32 docs, TerminateThread does not return when the target is
+    // the calling thread. This is unreachable in practice; parking keeps
+    // the (never-taken) fallback well-defined rather than returning
+    // through the now-abandoned normal path.
+    loop {
+        std::thread::park();
+    }
+}
+
+fn attach_impl() -> u32 {
     if ATTACHED.swap(true, Ordering::AcqRel) {
         return 0; // already attached — idempotent
     }
@@ -228,14 +426,63 @@ pub unsafe extern "system" fn HeapLensHookAttach() -> u32 {
         return 5;
     }
 
+    // 4. Canary: prove the trampoline actually works before trusting it
+    //    with a real target. A broken trampoline must never stay resident
+    //    — fail clean and detach rather than leave a corrupting hook
+    //    installed. Uses the real (now-hooked) process heap directly, not
+    //    the private heap, so this genuinely exercises the detour path a
+    //    real caller would take.
+    CANARY_HIT.store(false, Ordering::Release);
+    let canary_ptr = unsafe { HeapAlloc(GetProcessHeap(), 0, CANARY_SIZE) };
+    let canary_ok = !canary_ptr.is_null() && CANARY_HIT.load(Ordering::Acquire);
+    if !canary_ptr.is_null() {
+        unsafe { HeapFree(GetProcessHeap(), 0, canary_ptr as *const c_void) };
+    }
+    if !canary_ok {
+        let _ = unsafe { MinHook::disable_all_hooks() };
+        let _ = heaplens_alloc::request_writer_stop_and_wait(std::time::Duration::from_secs(2));
+        MinHook::uninitialize();
+        ORIG_HEAP_ALLOC.store(std::ptr::null_mut(), Ordering::Release);
+        ORIG_HEAP_REALLOC.store(std::ptr::null_mut(), Ordering::Release);
+        ORIG_HEAP_FREE.store(std::ptr::null_mut(), Ordering::Release);
+        let heap = PRIVATE_HEAP.swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if !heap.is_null() {
+            unsafe { HeapDestroy(heap as HANDLE) };
+        }
+        ATTACHED.store(false, Ordering::Release);
+        return 7;
+    }
+
     0
 }
 
 /// Returns 0 on success (including "was not attached" — idempotent), a
 /// nonzero failure code otherwise. Leaves the target exactly as if this DLL
 /// had never been loaded: hooks fully removed, private heap destroyed.
+///
+/// Unlike `HeapLensHookAttach`, this runs `detach_impl` directly on the
+/// calling thread rather than spawning a worker — spawning a *new* thread
+/// is itself unsafe while hooks are still globally active (a tenth,
+/// distinct hazard, the in-process sibling of the one documented on
+/// `HeapLensHookAttachRemote`/`WORKER_TID`: the new thread's own automatic
+/// `DLL_THREAD_ATTACH` notification reenters the still-active detour before
+/// `detach_impl` ever gets a chance to disable it). Confirmed empirically:
+/// this function used to spawn a worker (by analogy with `HeapLensHookAttach`
+/// — wrongly; `HeapLensHookAttach` needs a spawned thread to avoid running
+/// substantial work on a *raw `CreateRemoteThread` thread*, an unrelated
+/// concern), and self-load's harness — a direct, in-process, same-thread
+/// caller — crashed reliably at exactly that spawn, before `detach_impl`'s
+/// own first line ever printed. Running `detach_impl` directly on the
+/// caller's thread has no such issue: no new thread is created, so there is
+/// no notification to reenter anything. `heaplens-injector` never calls
+/// this function via `CreateRemoteThread` for a live (hooked) target for
+/// the same reason a spawn is unsafe here — see `HeapLensHookDetachApc`.
 #[unsafe(no_mangle)]
 pub unsafe extern "system" fn HeapLensHookDetach() -> u32 {
+    detach_impl()
+}
+
+fn detach_impl() -> u32 {
     if !ATTACHED.swap(false, Ordering::AcqRel) {
         return 0; // not attached — idempotent no-op
     }
@@ -291,4 +538,22 @@ pub unsafe extern "system" fn HeapLensHookDetach() -> u32 {
     }
 
     0
+}
+
+/// Queued via `QueueUserAPC` onto `attach_impl`'s worker thread (see
+/// `WORKER_TID`'s doc comment) — the primary path `heaplens-injector` uses
+/// to drive a real detach while hooks are active, avoiding the
+/// `DLL_THREAD_ATTACH`-on-a-fresh-`CreateRemoteThread`-thread hazard that a
+/// second `CreateRemoteThread` call would trigger. Matches `PAPCFUNC`'s
+/// required signature (`unsafe extern "system" fn(usize)`, no return value)
+/// — the result is published via `DETACH_RESULT` instead, since a queued
+/// APC has no return channel back to the process that queued it.
+///
+/// `HeapLensHookDetach` (above) is kept for direct, in-process callers
+/// (e.g. a future self-load-style test) where hooks being active at a raw
+/// thread's creation is not a concern because no new thread is involved.
+#[unsafe(no_mangle)]
+pub unsafe extern "system" fn HeapLensHookDetachApc(_param: usize) {
+    let rc = detach_impl();
+    DETACH_RESULT.store(rc as i32, Ordering::Release);
 }

@@ -38,11 +38,15 @@ pub async fn run(pipe_name: String, tx: mpsc::UnboundedSender<GraphMsg>) {
 
         let mut decoder = FrameDecoder::new();
         let mut buf = vec![0u8; 4096];
+        let mut handshook_pid: Option<u64> = None;
 
         loop {
             match server.read(&mut buf).await {
                 Ok(0) => {
                     info!("client disconnected");
+                    if let Some(pid) = handshook_pid {
+                        let _ = tx.send(GraphMsg::TargetDisconnected { pid });
+                    }
                     break;
                 }
                 Ok(n) => {
@@ -55,14 +59,18 @@ pub async fn run(pipe_name: String, tx: mpsc::UnboundedSender<GraphMsg>) {
                             Frame::Symbols(syms) => {
                                 let _ = tx.send(GraphMsg::Symbols(syms));
                             }
-                            Frame::Handshake { .. } => {
-                                // Informational only — pid/process name not currently used.
+                            Frame::Handshake { pid, name } => {
+                                handshook_pid = Some(pid);
+                                let _ = tx.send(GraphMsg::TargetConnected { pid, name });
                             }
                         }
                     }
                 }
                 Err(e) => {
                     warn!("pipe read error: {e}");
+                    if let Some(pid) = handshook_pid {
+                        let _ = tx.send(GraphMsg::TargetDisconnected { pid });
+                    }
                     break;
                 }
             }

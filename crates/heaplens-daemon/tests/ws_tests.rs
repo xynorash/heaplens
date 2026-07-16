@@ -52,6 +52,8 @@ async fn run_graph_loop(
                     }
                 }
                 Some(GraphMsg::Symbols(_)) => {}
+                Some(GraphMsg::TargetConnected { .. }) => {}
+                Some(GraphMsg::TargetDisconnected { .. }) => {}
                 Some(GraphMsg::Tick) => {
                     let diff = graph.drain_diff(&resolver);
                     if is_non_empty_diff(&diff) {
@@ -89,8 +91,12 @@ async fn start_test_server() -> (
     let (graph_tx, graph_rx) = mpsc::unbounded_channel::<GraphMsg>();
     let (connect_tx, connect_rx) = mpsc::unbounded_channel::<ConnectRequest>();
     let (broadcast_tx, _) = broadcast::channel::<Arc<GraphMessage>>(64);
+    // These tests don't exercise Stage 7 §3 control requests — no client
+    // sends any, so the receiver is simply left unconsumed.
+    let (target_tx, _target_rx) = mpsc::unbounded_channel::<heaplens_daemon::msg::TargetCmd>();
+    let (control_push_tx, _) = broadcast::channel::<Arc<heaplens_protocol::ControlResponse>>(16);
 
-    tokio::spawn(server::run(addr.clone(), connect_tx));
+    tokio::spawn(server::run(addr.clone(), connect_tx, target_tx, control_push_tx));
 
     let handle = tokio::spawn(run_graph_loop(graph_rx, connect_rx, broadcast_tx));
 

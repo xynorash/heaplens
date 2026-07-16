@@ -9,7 +9,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use heaplens_daemon::graph::OwnershipGraph;
 use heaplens_daemon::ingest;
-use heaplens_daemon::msg::{ConnectRequest, GraphMsg};
+use heaplens_daemon::msg::{ConnectRequest, GraphMsg, TargetCmd};
 use heaplens_daemon::resolver::Resolver;
 use heaplens_daemon::server;
 
@@ -74,7 +74,9 @@ async fn cross_process_wire_end_to_end() {
     drop(ws_listener);
     let ws_addr = format!("127.0.0.1:{ws_port}");
 
-    tokio::spawn(server::run(ws_addr.clone(), connect_tx));
+    let (target_tx, _target_rx) = mpsc::unbounded_channel::<TargetCmd>();
+    let (control_push_tx, _) = broadcast::channel::<Arc<heaplens_protocol::ControlResponse>>(16);
+    tokio::spawn(server::run(ws_addr.clone(), connect_tx, target_tx, control_push_tx));
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Start the pipe server BEFORE spawning the child.
@@ -152,7 +154,19 @@ async fn cross_process_wire_end_to_end() {
                             }
                         }
                     }
-                    _ => break,
+                    Some(GraphMsg::TargetConnected { .. }) | Some(GraphMsg::TargetDisconnected { .. }) => {
+                        continue;
+                    }
+                    // This test drives its own diff-drain inline in the
+                    // Events arm above rather than relying on a Tick
+                    // producer, so no Tick is ever sent here — but matched
+                    // explicitly rather than folded into the wildcard below,
+                    // so a future Tick sender doesn't silently fall into
+                    // "channel closed" and truncate collection (the exact
+                    // bug class that broke this file and hook_self_load_wire
+                    // when GraphMsg grew TargetConnected/TargetDisconnected).
+                    Some(GraphMsg::Tick) => continue,
+                    None => break,
                 },
                 req = connect_rx.recv() => {
                     if let Some(ConnectRequest { reply }) = req {

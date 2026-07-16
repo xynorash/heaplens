@@ -6,6 +6,7 @@ members = [
     "crates/heaplens-daemon",
     "crates/heaplens-launcher",
     "crates/heaplens-hook",
+    "crates/heaplens-injector",
     # TODO: heaplens-flutter (Stage 4)
 ]
 

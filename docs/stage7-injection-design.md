@@ -132,8 +132,8 @@ bytes a cooperative producer already produces.
   hits the same class of hazard one layer later (also a crash, isolated by
   disabling one thing at a time until each specific cause was found). Both
   are fixed the same way: force them to completion *eagerly*, before any
-  hook is installed. `HeapLensHookAttach` therefore performs, in this exact
-  order:
+  hook is installed. `attach_impl` (the shared core both exported attach
+  entry points drive — see §4.1) therefore performs, in this exact order:
   1. Create the private heap (§4.2).
   2. Start the writer thread (`heaplens_alloc::ensure_writer_started`).
   3. Warm `backtrace::resolve`'s one-time init
@@ -361,40 +361,91 @@ tool per invocation.
 
 ## 4. Safety and teardown
 
-### 4.1 Attach/detach as two explicit exported entry points, not `DllMain`
+### 4.1 Attach/detach as explicit exported entry points, not `DllMain`
 
-`heaplens-hook.dll` exports two functions, `HeapLensHookAttach` and
-`HeapLensHookDetach`. Neither runs from `DllMain`. Running MinHook
-installation or spawning threads from `DllMain` is a well-known deadlock
-hazard (the loader lock is held during `DllMain`, and MinHook / thread
-creation / pipe connection all need to run outside it). Instead,
-`heaplens-injector` uses the standard two-step injection pattern:
+`heaplens-hook.dll` exports `HeapLensHookAttach`/`HeapLensHookAttachRemote`
+(attach) and `HeapLensHookDetach`/`HeapLensHookDetachApc` (detach). None run
+from `DllMain`. Running MinHook installation or spawning threads from
+`DllMain` is a well-known deadlock hazard (the loader lock is held during
+`DllMain`, and MinHook / thread creation / pipe connection all need to run
+outside it). Instead, `heaplens-injector` uses the standard two-step
+injection pattern:
 
 1. `CreateRemoteThread` calling `LoadLibraryW` with the DLL path — loads the
    DLL, runs its (minimal, do-nothing) `DllMain`, returns the loaded module
    handle.
 2. A second `CreateRemoteThread` calling `GetProcAddress`-resolved
-   `HeapLensHookAttach` in the now-loaded module — this is where MinHook
-   initializes, hooks are installed, the private heap and writer thread are
-   created, and the pipe connection is opened. All real work happens here,
-   safely outside the loader lock.
+   `HeapLensHookAttachRemote` in the now-loaded module — this is where
+   MinHook initializes, hooks are installed, the private heap and writer
+   thread are created, and the pipe connection is opened. All real work
+   happens here, safely outside the loader lock.
 
-**`HeapLensHookAttach`'s internal ordering is a hard requirement, confirmed
+**`attach_impl`'s internal ordering is a hard requirement, confirmed
 empirically (§1.3), not an implementation detail:** private heap, then
 start the writer thread, then warm `backtrace::resolve`'s one-time init,
 then — only then — install and enable the MinHook hooks. Each of the first
 three must complete on this normal thread *before* any hook exists for a
 callback to reenter.
 
-**Detach's ordering is the reverse, and equally load-bearing — confirmed
-empirically as a fourth, distinct hazard, symmetric to the two above.**
-Even with hooks correctly disabled and both attach-time hazards fixed, a
-target still crashed if the writer thread was left running through
+**Two attach entry points, not one — a fifth hazard, found only under real
+cross-process injection (self-load cannot surface it):** a normal `return`
+from a `CreateRemoteThread` start routine makes the OS call `ExitThread`,
+which synchronously delivers `DLL_THREAD_DETACH` to every loaded DLL on
+that thread *before it dies* — unconditionally. With hooks now active
+(attach just succeeded), that notification's own heap traffic reenters the
+still-active detour on a thread `CreateRemoteThread` created directly
+(never touched by the CRT's own thread-init path), corrupting its stack
+(`STATUS_STACK_BUFFER_OVERRUN`) — not a generic access violation, a `/GS`
+stack-cookie mismatch, consistent with a real overrun rather than merely
+"unsafe to walk." Guarding what our own code does downstream (the
+recursion guard, §4.2) cannot fix a fault in the OS's own unavoidable
+teardown sequence.
+
+The fix: `HeapLensHookAttachRemote` never returns normally. After the
+shared `attach_and_wait()` core completes (spawns a normal, properly
+CRT-initialized worker thread to do the real attach work — see the
+existing rationale below — and blocks for its result), it marks itself
+permanently guarded and calls `TerminateThread(GetCurrentThread(), result)`
+on itself. `TerminateThread` is documented to skip `DLL_THREAD_DETACH`
+notification entirely when the target is the calling thread — the property
+needed here. This is safe specifically because the call is **synchronous
+self-termination issued only after every prior statement on this thread's
+own call stack has already returned** (not an external interrupt arriving
+mid-operation): `attach_and_wait()`'s `rx.recv()` has fully returned (and
+its `Receiver`'s `Drop` — which runs as part of that function's own,
+uninterrupted return — has already completed), and
+`force_enter_permanent()`'s thread-local write is a `const`-initialized
+fast-TLS store with no allocation. No Windows heap critical section or
+Rust lock is entered anywhere on this thread's path between `rx.recv()`
+returning and `TerminateThread` firing, so there is nothing left locked.
+This was also verified empirically, not just argued: the target's *own*
+threads keep allocating successfully — including on the private heap this
+same DLL uses internally — for the rest of a real attach/workload/detach
+cycle after `TerminateThread` fires (Step 2's acceptance gate captures 50
+allocations, 11 reallocations, and 51 frees after this point); a locked
+private-heap critical section would have hung every one of those.
+
+A **separate** entry point (`HeapLensHookAttach`, unconditional-`return`,
+no `TerminateThread`) exists for in-process callers — Step 1's self-load
+harness calls `HeapLensHookAttach` directly on its own long-lived main
+thread, where `TerminateThread`-ing the caller would kill that thread (and
+its still-pending workload) outright. This was confirmed the hard way: an
+earlier version of this fix applied `TerminateThread` inside the single
+shared `HeapLensHookAttach`, and it silently broke `hook_self_load_wire`'s
+gate (the harness process hung — its main thread was terminated mid-flow
+before it could run its own workload). The two entry points share one
+internal `attach_and_wait()` core and differ only in how the calling thread
+is allowed to return afterward.
+
+**Detach's ordering is the reverse of attach's, and equally load-bearing —
+confirmed empirically as a sixth, distinct hazard, symmetric to the fifth
+above.** Even with hooks correctly disabled and both attach-time hazards
+fixed, a target still crashed if the writer thread was left running through
 process/DLL teardown: a thread *exiting* naturally also triggers
 `DLL_THREAD_DETACH` notifications and TLS-destructor cleanup on that
 thread, which itself performs heap operations — if hooks are still active
 at that moment, those exit-time heap calls route through the detour during
-the exact window the thread is mid-teardown. `HeapLensHookDetach` therefore
+the exact window the thread is mid-teardown. `detach_impl` therefore
 performs, in this exact order:
 
 1. `MinHook::disable_all_hooks` — un-redirects the three hooked functions
@@ -410,14 +461,89 @@ performs, in this exact order:
    (frees the trampolines) and destroy the private heap.
 
 If the writer does not stop within the timeout, detach does **not**
-proceed to steps 3 — freeing MinHook's trampolines or the private heap out
+proceed to step 3 — freeing MinHook's trampolines or the private heap out
 from under a thread that may still be executing code depending on either
-is worse than leaving the hook installed. `heaplens-injector --detach`
-then calls `HeapLensHookDetach` via `CreateRemoteThread`, and — once it
-returns success — a final `CreateRemoteThread` calling
-`FreeLibraryAndExitThread` to unload the DLL from the target. After detach
+is worse than leaving the hook installed.
+
+**Detach never runs via a second `CreateRemoteThread` call — a seventh
+hazard, the sharpest one found in this stage.** The intuitive design
+(mirror attach: `CreateRemoteThread` a second time, targeting a
+`HeapLensHookDetach` export) was tried and crashes reliably, and the reason
+is structural, not fixable by changing what that export's body does:
+*creating* a new thread at all, while hooks are still globally active,
+makes the OS deliver `DLL_THREAD_ATTACH` to every loaded DLL on it
+*before any of that thread's own code ever runs* — the same reentrancy
+class as the fifth hazard, but at thread *start* instead of thread *end*,
+and entirely outside our control since it fires automatically ahead of the
+requested start routine. This was proven, not assumed: reducing
+`HeapLensHookDetach`'s body to a bare `return 42;` (no spawn, no real
+work at all) reproduced the identical crash whenever hooks were active at
+the moment the injector's second `CreateRemoteThread` call created the
+thread — isolating the fault to the thread's mere creation, not anything
+this module's code does once it has control.
+
+The fix avoids creating a second raw thread for detach entirely, reusing
+`attach_impl`'s own worker thread — already alive, already a normal,
+properly CRT-initialized Rust thread, safe by construction:
+
+1. That worker thread waits alertably (`SleepEx(INFINITE, TRUE)`) instead
+   of an inert `park()`, and publishes its own OS thread ID to an exported
+   `WORKER_TID: AtomicU32` static as its first action.
+2. `heaplens-injector` resolves `WORKER_TID`'s remote address the same way
+   it resolves exported functions (local `LoadLibraryW` + `GetProcAddress`,
+   offset applied to the target's own base), reads the TID via
+   `ReadProcessMemory`, resets an exported `DETACH_RESULT: AtomicI32`
+   static to its `-1` "pending" sentinel via `WriteProcessMemory` (guards
+   against a stale value from a prior attach/detach cycle in the same
+   process), opens the worker thread with `OpenThread(THREAD_SET_CONTEXT,
+   ...)`, and calls `QueueUserAPC` with `HeapLensHookDetachApc`'s resolved
+   remote address — no new thread is created, so there is no
+   `DLL_THREAD_ATTACH` notification to reenter anything.
+3. The queued APC runs `detach_impl()` on the worker thread once it next
+   enters its alertable wait, then stores the `u32` result (cast to `i32`)
+   into `DETACH_RESULT` via `Ordering::Release`. A queued APC has no return
+   channel back to the process that queued it, hence the exported static.
+4. The injector polls `DETACH_RESULT` via `ReadProcessMemory` (20ms
+   interval, 5s bound) until it observes a value other than `-1` — an
+   **explicit completion signal**, not a fixed-duration timing guess: the
+   loop only stops once it has actually observed the transition. The
+   `-1` sentinel never collides with a real `detach_impl` return value (0
+   or 6, the only codes it produces).
+
+   The `Ordering::Release` store on the worker thread and the
+   `ReadProcessMemory`-based poll on the injector side are not
+   synchronized by Rust's abstract memory model (that model only governs
+   same-process atomics) — the actual guarantee here is architectural:
+   `ReadProcessMemory` is a kernel transition, which cannot return content
+   older than the last write actually committed to that physical page, and
+   a naturally-aligned 32-bit store/load is atomic on x86/x64 (no torn
+   reads). `Ordering::Release` on the store side is still the correct,
+   intentional choice — it is what prevents the compiler/CPU from
+   reordering the result store to before `detach_impl`'s real teardown
+   work in program order on the worker thread, so once *any* observer
+   (including a cross-process poll) sees the new value, everything that
+   happened-before it on that thread — hooks disabled, writer stopped,
+   trampolines freed — is also complete.
+
+`HeapLensHookDetach` (unconditional direct call, no thread spawn) remains
+for in-process callers — Step 1's self-load harness calls it directly on
+its own thread, which needs neither the APC handshake nor a new thread.
+This function used to spawn a worker thread by analogy with attach before
+this hazard was understood; that was itself a live bug (spawning *any*
+thread while hooks are active hits the same reentrancy class, regardless of
+whether it is `CreateRemoteThread`-created or an ordinary in-process
+`std::thread::spawn`), and it crashed self-load's own detach path
+intermittently until reverted to running `detach_impl` directly on the
+caller's thread — no new thread, no notification, no hazard.
+
+`heaplens-injector --detach`, once the APC handshake reports success,
+issues one final `CreateRemoteThread` calling `FreeLibrary` to unload the
+DLL — safe by this point because hooks are already fully disabled and
+uninitialized, matching the same "no thread creation while hooks are live"
+condition attach's own raw thread satisfied by construction. After detach
 completes, the target process is left exactly as if `heaplens-hook.dll` had
-never been loaded — no dangling hooks, no leftover threads.
+never been loaded — no dangling hooks, no leftover threads holding any
+lock this module ever used.
 
 ### 4.2 Reentrancy inside the hook
 
@@ -464,7 +590,30 @@ handles a cooperative producer exiting mid-run). The daemon additionally
 uses the now-activated PID (§1.2) to mark the session as ended (rather than
 "awaiting the next connection," which is its current behavior for a
 disconnect) and to prompt Flutter to show "target process exited" rather
-than silently sitting on a stale graph.
+than silently sitting on a stale graph — surfaced as an unprompted
+`ControlResponse::TargetExited { pid }` broadcast (Step 4), not just a
+server-side log line.
+
+**The pid on that disconnect event is load-bearing, not decorative — a real
+race, found and fixed during Step 4's review.** A target *switch*
+(`TargetCmd::Attach` while one is already live) detaches the old target,
+then immediately attaches the new one, all within one `tokio::select!`
+branch's execution. The old target's pipe-close is detected *asynchronously*
+by `ingest.rs`, on its own task, and is not synchronized with
+`injector::detach()`'s completion — that disconnect event can arrive
+*after* the graph loop has already moved `attached_pid` on to the new
+target. Without checking which pid the disconnect is actually for, that
+stale event would be indistinguishable from the new target exiting:
+`attached_pid` would be wrongly cleared and `TargetExited` broadcast for a
+target that had just successfully attached and was still running. Fixed by
+carrying the pid on `GraphMsg::TargetDisconnected` and gating the
+clear/broadcast on it matching the currently-tracked target
+(`msg::is_current_target_exit`, unit-tested directly — the race itself
+isn't reliably reproducible in a fast deterministic test, so the decision
+rule is pinned down instead). A plain, non-switch `DetachTarget` was
+already safe from this by construction (it clears `attached_pid`
+synchronously *before* the pipe even starts closing), so only the switch
+path needed the fix — but both now go through the same pid-checked path.
 
 ### 4.5 Reversibility summary
 
@@ -603,16 +752,30 @@ Flutter-only rendering and layout work.
 
 ## 6. Summary of protocol/architecture impact
 
-- **Wire protocol (`heaplens-protocol`):** No schema change.
-  `Frame::Handshake`'s `pid` field goes from decoded-and-discarded to
-  decoded-and-used. This is a semantic activation, not a format change.
-- **Daemon (`heaplens-daemon`):** `ingest.rs` needs no changes to accept an
-  injected session (a hook DLL connection is indistinguishable from a
-  cooperative producer's). New: WS control messages (`ListProcesses`,
-  `AttachTarget`, `DetachTarget`), process enumeration, spawning/waiting on
-  `heaplens-injector`, session-lifecycle bookkeeping (now-active PID,
-  target-exit detection via the now-used Handshake pid), graph-clear on
-  target switch (§3.4).
+- **Wire protocol (`heaplens-protocol`):** the pipe/event protocol
+  (`Frame`/`AllocEvent`, the daemon-facing hook→daemon transport) has no
+  schema change. `Frame::Handshake`'s `pid` field goes from
+  decoded-and-discarded to decoded-and-used — a semantic activation, not a
+  format change. This "no schema change" claim is scoped to that pipe/event
+  surface specifically, **not** the WS surface: Step 3 added a genuinely
+  new `heaplens-protocol::control` module (`ControlRequest`/
+  `ControlResponse`/`ProcessInfo`) for the daemon↔client WS control
+  channel — a different transport from the pipe/event one, tagged JSON
+  alongside the pre-existing `GraphMessage` on the same WS connection (no
+  new connection/port). The distinction matters: the capture pipeline's own
+  wire format is untouched by injection; the UI-facing control surface
+  necessarily grew to carry attach/detach/process-list requests that did
+  not previously exist.
+- **Daemon (`heaplens-daemon`):** `ingest.rs` needs no protocol changes to
+  accept an injected session (a hook DLL connection is indistinguishable
+  from a cooperative producer's) — it does now forward the Handshake pid as
+  `GraphMsg::TargetConnected`/detect disconnect as `TargetDisconnected`,
+  both consumed by the graph-loop task. New: WS control messages
+  (`ListProcesses`, `AttachTarget`, `DetachTarget`), process enumeration
+  (`procs.rs`, real per-process `IsWow64Process2` arch probing — not
+  stubbed), spawning/waiting on `heaplens-injector` (`injector.rs`),
+  session-lifecycle bookkeeping (now-active PID, target-exit detection via
+  the now-used Handshake pid), graph-clear on target switch (§3.4).
 - **φ / graph (`graph.rs`):** No changes. Its dependency on symbolizable
   frames is unchanged and is now understood to be inherent to the injection
   use case, not just a build-configuration concern (§2).
@@ -716,43 +879,87 @@ assertion out, both before and after detach — proves the capture pipeline
 itself is correct in isolation, before injection introduces its own
 variables in Step 2.
 
-### Step 2 — `heaplens-injector`, tested against the Step 1 harness as the target
+### Step 2 — `heaplens-injector`, tested against a cooperative, separate target
 
 Build the injector: architecture check (`IsWow64Process2`), `OpenProcess`
 with minimal rights, the two-step `CreateRemoteThread` sequence
-(`LoadLibraryW` then `HeapLensHookAttach`), and the symmetric detach
-sequence (`HeapLensHookDetach` then `FreeLibraryAndExitThread`).
+(`LoadLibraryW` then `HeapLensHookAttachRemote`), and the detach handshake
+(`QueueUserAPC`-driven `HeapLensHookDetachApc`, then `FreeLibrary` once it
+reports success — see §4.1 for why detach does not mirror attach's
+`CreateRemoteThread` pattern).
 
-**Acceptance gate:** run the Step 1 test harness as a plain, unmodified,
-*already-running* process (no self-attach code path used this time), and
+**Acceptance gate:** run a plain, separate, debug-info-carrying test
+process (`injection_target.exe` — not Step 1's self-load harness, which
+tests a different code path; not a stripped/no-debug-info target, that is
+Step 6's deliberate later sequencing) as an *already-running* process, and
 have `heaplens-injector <pid> --attach` inject into it externally. Confirm
 identical results to Step 1's gate (event capture correct, clean detach)
-but now via real cross-process injection. Additionally verify the three
-validation paths from §3.3 (arch mismatch, access denied, target-exited)
+but now via real cross-process injection. Additionally verify the
+validation paths from §3.3 (nonexistent/inaccessible PID, malformed PID)
 each produce the specified error message rather than crashing the injector
 or the target. This is the step where loader-lock safety (§4.1) and the
 private-heap reentrancy guard (§4.2) get their real test — they cannot be
 meaningfully verified until injection is happening into a separate process.
 
+**Done — complete (`dev/phase_7`).** Real cross-process injection surfaced
+three further hazards self-load could not (§4.1's fifth, sixth, and seventh
+hazards) — validating this step's own separation rationale from Step 1.
+Test: `crates/heaplens-daemon/tests/hook_injection_wire.rs`, mirroring Step
+1's pointer-identity matching methodology but driving real attach/detach via
+`heaplens-injector.exe` subprocess calls timed against the target's own
+`TARGET_PID=`/`WORKLOAD_DONE` stdout markers.
+
 ### Step 3 — daemon WS control messages + process enumeration
 
-Add `ListProcesses`, `AttachTarget`, `DetachTarget`, and (§4.6) `Shutdown`
-to the existing WS control message enum. Implement `CreateToolhelp32Snapshot`-based
-enumeration, the daemon-side orchestration of spawning
-`heaplens-injector` (§3.2), the single-target transition sequence (§3.4,
-including graph-clear), and target-exit detection via the now-activated
-Handshake `pid` (§4.4).
+Add `ListProcesses`, `AttachTarget`, `DetachTarget` as an inbound WS
+control-request channel (`heaplens-protocol::control::ControlRequest`/
+`ControlResponse`, a new tagged-JSON pair alongside the existing
+`GraphMessage`, on the *same* WS connection — no new transport).
+`Shutdown` (§4.6) is deliberately **not** added here — it belongs to the
+launcher's own teardown sequence, which Step 5 owns; bundling it into Step
+3 would mean testing it before Step 5's dedicated gate exists for it.
+Implement `CreateToolhelp32Snapshot`-based enumeration (`procs.rs`), the
+daemon-side orchestration of spawning `heaplens-injector` (§3.2,
+`injector.rs` — a short-lived, synchronous child process per attach/detach
+call, not a long-lived process to track), the single-target transition
+sequence (§3.4, including graph-clear), and target-exit detection via the
+now-activated Handshake `pid` (§4.4, `GraphMsg::TargetConnected`/
+`TargetDisconnected`).
+
+All three control requests and the target-switch transition are owned by
+the same single-threaded graph-loop task in `main.rs` that already owns
+graph/resolver/storm-tracker state (not a separate actor) — the natural
+place to clear that state on a switch, since no message round-trip to
+another task is needed to do it.
 
 **Acceptance gate:** without any Flutter UI yet, drive these WS messages
-directly (a test script or `wscat`-equivalent against the daemon's existing
-WS endpoint) against the Step 1 harness as target. Confirm: process list
-includes the harness with correct pid/name/arch; `AttachTarget` results in
-events flowing and appearing in the daemon's graph; sending `AttachTarget`
-for a second target while one is attached correctly runs the full
-detach-then-clear-then-attach sequence (§3.4) with no stale nodes from the
-first target visible afterward; `DetachTarget` cleanly ends the session;
-target process exit is detected and reported without requiring an explicit
-`DetachTarget`.
+directly against the daemon's existing WS endpoint, against a real,
+separate, cooperative target (`injection_target.exe`, Step 2's target, run
+as an already-running process — not Step 1's self-load harness, which has
+no separate pid to attach to). Confirm: process list includes the target
+with correct pid/name/arch; `AttachTarget` results in events flowing and
+appearing in the daemon's graph, driven purely through the WS control
+channel (no direct `heaplens-injector` CLI call from the test); sending
+`AttachTarget` for a second target while one is attached correctly runs the
+full detach-then-clear-then-attach sequence (§3.4), with an observed empty
+snapshot between the two targets' node sets as positive evidence of a
+clear, not a merge; `DetachTarget` cleanly ends the session.
+
+**Done — complete (`dev/phase_7`).** Test:
+`crates/heaplens-daemon/tests/control_target_switch.rs`, run against the
+real `heaplens-daemon.exe` binary (not an in-process mini graph loop —
+Step 3's actual new code, process spawning and the switch transition, only
+lives in `main.rs`'s real graph loop). One regression caught and fixed
+during this step: two pre-existing tests
+(`hook_self_load_wire.rs`/`cross_process_wire.rs`) had their own local
+`GraphMsg` collector loops with a `_ => break` wildcard that had, until
+this step, never needed to match anything beyond `Events`/`Symbols` — once
+`ingest.rs` started forwarding the newly-activated Handshake as
+`GraphMsg::TargetConnected`, that wildcard caught it and silently ended
+event collection at the first message of every run (before any real
+events arrived), which made both gates report zero captured events. Fixed
+by adding explicit ignore arms for the two new `GraphMsg` variants in both
+files, ahead of their `_ => break` catch-alls.
 
 ### Step 4 — Flutter process picker
 

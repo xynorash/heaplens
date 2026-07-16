@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:heaplens_flutter/models/control.dart';
 import 'package:heaplens_flutter/models/graph_diff.dart';
 import 'package:heaplens_flutter/providers/ws_provider.dart';
 
@@ -11,6 +12,9 @@ import 'package:heaplens_flutter/providers/ws_provider.dart';
 const _snapshotJson =
     '{"type":"snapshot","ts":1,"nodes":[]}';
 const _badJson = 'not json';
+const _processListJson = '{"type":"process_list","processes":[{"pid":1,"name":"a.exe","arch":"x64"}]}';
+const _attachResultJson = '{"type":"attach_result","ok":true,"message":"attached to pid 1"}';
+const _targetExitedJson = '{"type":"target_exited","pid":1}';
 
 void main() {
   group('reconnectBackoff', () {
@@ -37,11 +41,13 @@ void main() {
     late List<ConnectionStatus> statuses;
     late List<GraphMessage> messages;
     late List<Object> errors;
+    late List<ControlResponse> controlMessages;
 
     setUp(() {
       statuses = [];
       messages = [];
       errors = [];
+      controlMessages = [];
     });
 
     GraphMessageConnection buildConnection({
@@ -54,6 +60,7 @@ void main() {
         onStatus: statuses.add,
         onMessage: messages.add,
         onError: (e, st) => errors.add(e),
+        onControlMessage: controlMessages.add,
       );
     }
 
@@ -268,6 +275,139 @@ void main() {
 
       // dispose() must prevent the scheduled reconnect from firing.
       expect(callCount, 1);
+    });
+  });
+
+  group('GraphMessageConnection control-message dispatch', () {
+    late List<GraphMessage> messages;
+    late List<ControlResponse> controlMessages;
+    late List<Object> errors;
+
+    GraphMessageConnection buildConnection(WsConnector connector) {
+      messages = [];
+      controlMessages = [];
+      errors = [];
+      return GraphMessageConnection(
+        connector: connector,
+        backoff: (_) => Duration.zero,
+        onStatus: (_) {},
+        onMessage: messages.add,
+        onError: (e, st) => errors.add(e),
+        onControlMessage: controlMessages.add,
+      );
+    }
+
+    test('a process_list frame routes to onControlMessage, not onMessage', () async {
+      final controller = StreamController<dynamic>();
+      final connection = buildConnection(() => WsFrames(controller.stream, () {}));
+      connection.start();
+
+      controller.add(_processListJson);
+      await Future<void>.delayed(Duration.zero);
+
+      expect(controlMessages, hasLength(1));
+      expect(controlMessages.single, isA<ProcessListResponse>());
+      expect(messages, isEmpty);
+      expect(errors, isEmpty);
+
+      connection.dispose();
+      await controller.close();
+    });
+
+    test('an attach_result and a snapshot on the same stream each route correctly', () async {
+      final controller = StreamController<dynamic>();
+      final connection = buildConnection(() => WsFrames(controller.stream, () {}));
+      connection.start();
+
+      controller.add(_attachResultJson);
+      controller.add(_snapshotJson);
+      await Future<void>.delayed(Duration.zero);
+
+      expect(controlMessages, hasLength(1));
+      expect(controlMessages.single, isA<AttachResultResponse>());
+      expect(messages, hasLength(1));
+      expect(messages.single, isA<GraphSnapshot>());
+      expect(errors, isEmpty);
+
+      connection.dispose();
+      await controller.close();
+    });
+
+    test('a target_exited push routes to onControlMessage like any other control frame', () async {
+      final controller = StreamController<dynamic>();
+      final connection = buildConnection(() => WsFrames(controller.stream, () {}));
+      connection.start();
+
+      controller.add(_targetExitedJson);
+      await Future<void>.delayed(Duration.zero);
+
+      expect(controlMessages, hasLength(1));
+      expect((controlMessages.single as TargetExitedResponse).pid, 1);
+
+      connection.dispose();
+      await controller.close();
+    });
+
+    test('a control frame is dropped (not errored) if onControlMessage is not supplied', () async {
+      final controller = StreamController<dynamic>();
+      final localMessages = <GraphMessage>[];
+      final localErrors = <Object>[];
+      final connection = GraphMessageConnection(
+        connector: () => WsFrames(controller.stream, () {}),
+        backoff: (_) => Duration.zero,
+        onStatus: (_) {},
+        onMessage: localMessages.add,
+        onError: (e, st) => localErrors.add(e),
+        // onControlMessage intentionally omitted.
+      );
+      connection.start();
+
+      controller.add(_processListJson);
+      await Future<void>.delayed(Duration.zero);
+
+      expect(localErrors, isEmpty, reason: 'a recognized control type with no handler should be a silent no-op, not an error');
+      expect(localMessages, isEmpty);
+
+      connection.dispose();
+      await controller.close();
+    });
+  });
+
+  group('GraphMessageConnection.sendRequest', () {
+    test('encodes the request and forwards it to the current connection\'s send function', () async {
+      final sent = <String>[];
+      final controller = StreamController<dynamic>();
+      final connection = GraphMessageConnection(
+        connector: () => WsFrames(controller.stream, () {}, sent.add),
+        backoff: (_) => Duration.zero,
+        onStatus: (_) {},
+        onMessage: (_) {},
+        onError: (e, st) {},
+      );
+      connection.start();
+
+      connection.sendRequest(const AttachTargetRequest(4242));
+
+      expect(sent, hasLength(1));
+      expect(sent.single, '{"type":"attach_target","pid":4242}');
+
+      connection.dispose();
+      await controller.close();
+    });
+
+    test('is a silent no-op while not connected (no current send function)', () async {
+      final connection = GraphMessageConnection(
+        connector: () => throw StateError('never connects'),
+        backoff: (_) => Duration.zero,
+        onStatus: (_) {},
+        onMessage: (_) {},
+        onError: (e, st) {},
+      );
+      connection.start(); // connector throws; onError'd internally, no send is ever set.
+
+      expect(() => connection.sendRequest(const DetachTargetRequest()), returnsNormally);
+
+      connection.dispose();
     });
   });
 
