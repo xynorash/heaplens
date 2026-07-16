@@ -43,7 +43,7 @@ async fn loopback_alloc_and_tick_produces_diff() {
                 for ev in &events {
                     match ev.kind {
                         0 => graph.on_alloc(ev, &resolver),
-                        1 => graph.on_dealloc(ev.ptr),
+                        1 => graph.on_dealloc(ev.ptr, ev.ts_nanos),
                         2 => graph.on_realloc(ev.old_ptr, ev.ptr, ev.size, &resolver),
                         _ => {}
                     }
@@ -96,7 +96,7 @@ async fn loopback_dealloc_produces_remove() {
                 for ev in &events {
                     match ev.kind {
                         0 => graph.on_alloc(ev, &resolver),
-                        1 => graph.on_dealloc(ev.ptr),
+                        1 => graph.on_dealloc(ev.ptr, ev.ts_nanos),
                         2 => graph.on_realloc(ev.old_ptr, ev.ptr, ev.size, &resolver),
                         _ => {}
                     }

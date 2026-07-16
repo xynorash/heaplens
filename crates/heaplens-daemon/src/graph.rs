@@ -20,6 +20,13 @@ pub struct Node {
     pub had_owner_once: bool,
     /// Current anomaly classification; updated by anomaly::sweep.
     pub state: NodeState,
+    /// `ts_nanos` of the dealloc event that freed this node's owner, if any —
+    /// set once in `on_dealloc` when the owner is freed and this node is
+    /// orphaned. Observability-only: never read by `infer_ownership` or
+    /// `anomaly::sweep`'s state predicates, so it cannot influence detection
+    /// timing or outcome. Exists so H1 (detection-latency measurement) has a
+    /// real owner-free timestamp to measure from instead of inferring one.
+    pub owner_free_ts: Option<u64>,
 }
 
 pub struct OwnershipGraph {
@@ -74,6 +81,7 @@ impl OwnershipGraph {
             edges_out: Vec::new(),
             had_owner_once: owner_id.is_some(),
             state: NodeState::Healthy,
+            owner_free_ts: None,
         };
 
         // Register as a child of the owner.
@@ -89,7 +97,7 @@ impl OwnershipGraph {
         self.added.push(id);
     }
 
-    pub fn on_dealloc(&mut self, ptr: u64) {
+    pub fn on_dealloc(&mut self, ptr: u64, ts_nanos: u64) {
         let id = match self.by_ptr.remove(&ptr) {
             Some(id) => id,
             None => return,
@@ -109,6 +117,9 @@ impl OwnershipGraph {
             if let Some(child) = self.nodes.get_mut(&cid) {
                 child.owner = None;
                 child.had_owner_once = true;
+                // Observability-only: records which dealloc caused this —
+                // does not feed into ownership or anomaly-state logic.
+                child.owner_free_ts = Some(ts_nanos);
             }
             self.updated.insert(cid);
         }
@@ -281,6 +292,10 @@ impl OwnershipGraph {
 
     pub fn nodes_mut(&mut self) -> &mut std::collections::HashMap<u64, Node> {
         &mut self.nodes
+    }
+
+    pub fn nodes(&self) -> &std::collections::HashMap<u64, Node> {
+        &self.nodes
     }
 
     fn node_to_dto(n: &Node, resolver: &Resolver) -> NodeDto {

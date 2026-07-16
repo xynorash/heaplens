@@ -8,12 +8,12 @@ use heaplens_daemon::{
     config::Config,
     graph::OwnershipGraph,
     ingest,
-    msg::{ConnectRequest, GraphMsg, StoreMsg},
+    msg::{ConnectRequest, GraphMsg, OrphanEventRecord, StoreMsg},
     resolver::Resolver,
     server,
     store,
 };
-use heaplens_protocol::GraphMessage;
+use heaplens_protocol::{GraphMessage, NodeState};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -86,7 +86,7 @@ async fn main() -> anyhow::Result<()> {
                                     );
                                 }
                             }
-                            1 => graph.on_dealloc(ev.ptr),
+                            1 => graph.on_dealloc(ev.ptr, ev.ts_nanos),
                             2 => graph.on_realloc(ev.old_ptr, ev.ptr, ev.size, &resolver),
                             _ => {}
                         }
@@ -103,8 +103,32 @@ async fn main() -> anyhow::Result<()> {
                     let max_ts = graph.max_ts_seen;
                     storm_tracker.evict_idle(max_ts, &config);
                     let changed = sweep(graph.nodes_mut(), max_ts, &config);
-                    for id in changed {
+
+                    // Observability-only: for nodes that just flipped to
+                    // Orphan, pair the owner-free ts (recorded on the node
+                    // by on_dealloc, at the moment it happened) with this
+                    // tick's ts as the detection ts. sweep() above has
+                    // already fully decided `changed` and each node's
+                    // `state` — this only reads that decision, it cannot
+                    // feed back into it.
+                    let mut orphan_events: Vec<OrphanEventRecord> = Vec::new();
+                    for &id in &changed {
                         graph.mark_updated(id);
+                        if let Some(node) = graph.nodes().get(&id) {
+                            if node.state == NodeState::Orphan {
+                                if let Some(owner_free_ts_ns) = node.owner_free_ts {
+                                    orphan_events.push(OrphanEventRecord {
+                                        node_id: id,
+                                        owner_free_ts_ns,
+                                        orphan_detected_ts_ns: max_ts,
+                                        tau_ms: config.tau_ms,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    if !orphan_events.is_empty() {
+                        let _ = store_tx.send(StoreMsg::OrphanEvents(orphan_events));
                     }
 
                     let diff = graph.drain_diff(&resolver);

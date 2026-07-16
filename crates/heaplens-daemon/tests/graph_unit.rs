@@ -366,7 +366,7 @@ fn dealloc_orphans_children() {
 
     let _ = g.drain_diff(&r);
 
-    g.on_dealloc(0x1000);
+    g.on_dealloc(0x1000, 500);
 
     let diff = g.drain_diff(&r);
     let (_, updated, removed) = unwrap_diff(diff);
@@ -398,8 +398,8 @@ fn cascaded_dealloc_same_tick_disjoint() {
     g.on_alloc(&c_ev, &r);
 
     // No drain between the two deallocs — both within the same tick
-    g.on_dealloc(0x2000); // child first
-    g.on_dealloc(0x1000); // then owner
+    g.on_dealloc(0x2000, 500); // child first
+    g.on_dealloc(0x1000, 600); // then owner
 
     let diff = g.drain_diff(&r);
     let (add, update, remove) = unwrap_diff(diff);

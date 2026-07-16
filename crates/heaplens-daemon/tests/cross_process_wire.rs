@@ -128,7 +128,7 @@ async fn cross_process_wire_end_to_end() {
                                     graph.on_alloc(ev, &resolver);
                                     alloc_count += 1;
                                 }
-                                1 => graph.on_dealloc(ev.ptr),
+                                1 => graph.on_dealloc(ev.ptr, ev.ts_nanos),
                                 2 => graph.on_realloc(ev.old_ptr, ev.ptr, ev.size, &resolver),
                                 _ => {}
                             }
