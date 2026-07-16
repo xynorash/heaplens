@@ -45,7 +45,7 @@ async fn run_graph_loop(
                     for ev in &events {
                         match ev.kind {
                             0 => graph.on_alloc(ev, &resolver),
-                            1 => graph.on_dealloc(ev.ptr),
+                            1 => graph.on_dealloc(ev.ptr, ev.ts_nanos),
                             2 => graph.on_realloc(ev.old_ptr, ev.ptr, ev.size, &resolver),
                             _ => {}
                         }

@@ -27,7 +27,13 @@ pub fn open(path: &str) -> Result<(tokio_mpsc::UnboundedSender<StoreMsg>, std::t
             symbol  TEXT    NOT NULL,
             state   TEXT    NOT NULL
         );
-        CREATE INDEX IF NOT EXISTS idx_ts ON nodes(ts);",
+        CREATE INDEX IF NOT EXISTS idx_ts ON nodes(ts);
+        CREATE TABLE IF NOT EXISTS orphan_events (
+            node_id               INTEGER NOT NULL,
+            owner_free_ts_ns      INTEGER NOT NULL,
+            orphan_detected_ts_ns INTEGER NOT NULL,
+            tau_ms                INTEGER NOT NULL
+        );",
     )?;
 
     let (std_tx, std_rx) = std_mpsc::channel::<StoreMsg>();
@@ -46,6 +52,7 @@ pub fn open(path: &str) -> Result<(tokio_mpsc::UnboundedSender<StoreMsg>, std::t
     let handle = thread::spawn(move || {
         let batch_interval = Duration::from_millis(100);
         let mut batch: Vec<heaplens_protocol::NodeDto> = Vec::new();
+        let mut orphan_batch: Vec<crate::msg::OrphanEventRecord> = Vec::new();
         let mut deadline = std::time::Instant::now() + batch_interval;
 
         loop {
@@ -61,6 +68,10 @@ pub fn open(path: &str) -> Result<(tokio_mpsc::UnboundedSender<StoreMsg>, std::t
                     batch.extend(dtos);
                     // Do NOT reset deadline — let it fire at the fixed interval.
                 }
+                Ok(StoreMsg::OrphanEvents(records)) => {
+                    orphan_batch.extend(records);
+                    // Same fixed-interval batching as the Nodes path above.
+                }
                 Ok(StoreMsg::Flush) | Err(std_mpsc::RecvTimeoutError::Timeout) => {
                     if !batch.is_empty() {
                         if let Err(e) = commit_batch(&conn, &batch) {
@@ -68,12 +79,23 @@ pub fn open(path: &str) -> Result<(tokio_mpsc::UnboundedSender<StoreMsg>, std::t
                         }
                         batch.clear();
                     }
+                    if !orphan_batch.is_empty() {
+                        if let Err(e) = commit_orphan_batch(&conn, &orphan_batch) {
+                            warn!("store orphan-event commit failed: {e}");
+                        }
+                        orphan_batch.clear();
+                    }
                     deadline = std::time::Instant::now() + batch_interval;
                 }
                 Ok(StoreMsg::Shutdown) | Err(std_mpsc::RecvTimeoutError::Disconnected) => {
                     if !batch.is_empty() {
                         if let Err(e) = commit_batch(&conn, &batch) {
                             warn!("store final commit failed: {e}");
+                        }
+                    }
+                    if !orphan_batch.is_empty() {
+                        if let Err(e) = commit_orphan_batch(&conn, &orphan_batch) {
+                            warn!("store final orphan-event commit failed: {e}");
                         }
                     }
                     info!("store thread exiting");
@@ -105,6 +127,24 @@ fn commit_batch(conn: &Connection, batch: &[heaplens_protocol::NodeDto]) -> Resu
                 dto.ts as i64,
                 &dto.symbol,
                 state_str
+            ],
+        )?;
+    }
+    tx.commit()?;
+    Ok(())
+}
+
+fn commit_orphan_batch(conn: &Connection, batch: &[crate::msg::OrphanEventRecord]) -> Result<()> {
+    let tx = conn.unchecked_transaction()?;
+    for rec in batch {
+        tx.execute(
+            "INSERT INTO orphan_events (node_id, owner_free_ts_ns, orphan_detected_ts_ns, tau_ms) \
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                rec.node_id as i64,
+                rec.owner_free_ts_ns as i64,
+                rec.orphan_detected_ts_ns as i64,
+                rec.tau_ms as i64,
             ],
         )?;
     }
