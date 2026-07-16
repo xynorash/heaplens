@@ -1,0 +1,17 @@
+[package]
+name = "h1-harness"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "h1-harness"
+path = "src/main.rs"
+
+[dependencies]
+heaplens-protocol = { path = "../heaplens-protocol" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "io-util", "sync", "time", "process", "fs"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
+serde_json = "1"
+anyhow = "1"
+rusqlite = { version = "0.32", features = ["bundled"] }

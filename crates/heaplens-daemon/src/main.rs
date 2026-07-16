@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use heaplens_daemon::{
@@ -101,6 +101,12 @@ async fn main() -> anyhow::Result<()> {
                     warned_sites.clear();
                     // Anomaly sweep — returns ids of nodes whose state changed.
                     let max_ts = graph.max_ts_seen;
+                    // Diagnostic only (opt-in via RUST_LOG=heaplens_daemon=debug,
+                    // silent at the default "info" level, no behavior change):
+                    // lets an external observer reconstruct real wall-clock tick
+                    // cadence during a run, to distinguish steady ~tick_ms sweep
+                    // timing from queue-backlog draining. Not part of detection.
+                    debug!(max_ts, "tick");
                     storm_tracker.evict_idle(max_ts, &config);
                     let changed = sweep(graph.nodes_mut(), max_ts, &config);
 
