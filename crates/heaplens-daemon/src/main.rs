@@ -66,11 +66,27 @@ async fn main() -> anyhow::Result<()> {
     let mut storm_tracker = StormTracker::new();
     let mut warned_sites: std::collections::HashSet<u64> = std::collections::HashSet::new();
 
+    // Observability-only state for the Flutter target-diagnostics banner
+    // (see heaplens_flutter/lib/providers/target_diagnostics_provider.dart).
+    // None of this is read by phi or anomaly::sweep.
+    let mut events_received: u64 = 0;
+    let mut target_pid: Option<u64> = None;
+    let mut target_name: Option<String> = None;
+    let mut last_stats_sent = std::time::Instant::now();
+    const STATS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1000);
+
     // Graph loop — single-threaded owner of all graph state.
     loop {
         tokio::select! {
             msg = rx.recv() => match msg {
                 Some(GraphMsg::Events(events)) => {
+                    // Observability-only: counts every raw event as it
+                    // arrives, before any diff-visibility filtering — so it
+                    // stays accurate even for nodes born and freed within
+                    // the same tick, which drain_diff never surfaces (see
+                    // its doc comment). Read only by the Stats broadcast
+                    // below, never by phi or anomaly::sweep.
+                    events_received += events.len() as u64;
                     for ev in &events {
                         match ev.kind {
                             0 => {
@@ -96,6 +112,10 @@ async fn main() -> anyhow::Result<()> {
                     for (addr, name, is_machinery) in syms {
                         resolver.insert(addr, name, is_machinery);
                     }
+                }
+                Some(GraphMsg::Handshake { pid, name }) => {
+                    target_pid = Some(pid);
+                    target_name = Some(name);
                 }
                 Some(GraphMsg::Tick) => {
                     warned_sites.clear();
@@ -151,6 +171,27 @@ async fn main() -> anyhow::Result<()> {
                     if is_non_empty_diff(&diff) {
                         let _ = broadcast_tx.send(Arc::new(diff));
                     }
+
+                    // Observability-only: broadcast session counters on a
+                    // fixed 1s cadence (decoupled from tick_ms so this is a
+                    // steady heartbeat, not a per-tick spam) — the Flutter
+                    // target-diagnostics banner needs this even when the
+                    // graph itself is producing no diffs at all, since
+                    // that's exactly the "no heap activity" case it must
+                    // detect. Never read by phi or anomaly::sweep.
+                    if last_stats_sent.elapsed() >= STATS_INTERVAL {
+                        last_stats_sent = std::time::Instant::now();
+                        let (symbols_resolved, hex_fallback) = graph.symbol_stats(&resolver);
+                        let stats = GraphMessage::Stats {
+                            ts: max_ts,
+                            events_received,
+                            symbols_resolved,
+                            hex_fallback,
+                            target_pid,
+                            target_name: target_name.clone(),
+                        };
+                        let _ = broadcast_tx.send(Arc::new(stats));
+                    }
                 }
                 None => break,
             },
@@ -184,6 +225,6 @@ fn is_non_empty_diff(msg: &GraphMessage) -> bool {
         GraphMessage::Diff { add, update, remove, .. } => {
             !add.is_empty() || !update.is_empty() || !remove.is_empty()
         }
-        GraphMessage::Snapshot { .. } => false,
+        GraphMessage::Snapshot { .. } | GraphMessage::Stats { .. } => false,
     }
 }

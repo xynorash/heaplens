@@ -73,6 +73,13 @@ class GraphNotifier extends Notifier<int> {
         for (final id in diff.remove) {
           _nodes.remove(id);
         }
+      case GraphStats _:
+        // Stats messages carry session counters, not node data — they must
+        // not touch the node map or bump revision (that would trigger
+        // needless graph rebuilds/repaints for something that never changes
+        // what's on screen here). See target_diagnostics_provider.dart for
+        // the listener that actually consumes them.
+        return;
     }
     state = state + 1;
   }

@@ -23,6 +23,8 @@ sealed class GraphMessage {
         return GraphSnapshot.fromJson(json);
       case 'diff':
         return GraphDiff.fromJson(json);
+      case 'stats':
+        return GraphStats.fromJson(json);
       default:
         throw FormatException('GraphMessage.fromJson: unknown type "$type"');
     }
@@ -69,6 +71,41 @@ final class GraphDiff extends GraphMessage {
           .map((n) => NodeDto.fromJson(n as Map<String, dynamic>))
           .toList(),
       remove: (json['remove'] as List<dynamic>).cast<int>(),
+    );
+  }
+}
+
+/// Observability message: `{ "type": "stats", "ts": ..., "events_received":
+/// ..., "symbols_resolved": ..., "hex_fallback": ..., "target_pid": ...,
+/// "target_name": ... }`. Never affects phi/detection on the daemon side —
+/// purely a periodic counter snapshot consumed by the target-diagnostics
+/// banner (see `providers/target_diagnostics_provider.dart`). `targetPid`/
+/// `targetName` are null until the daemon has received a HANDSHAKE frame
+/// from the attached target.
+final class GraphStats extends GraphMessage {
+  final int eventsReceived;
+  final int symbolsResolved;
+  final int hexFallback;
+  final int? targetPid;
+  final String? targetName;
+
+  const GraphStats({
+    required super.ts,
+    required this.eventsReceived,
+    required this.symbolsResolved,
+    required this.hexFallback,
+    this.targetPid,
+    this.targetName,
+  });
+
+  factory GraphStats.fromJson(Map<String, dynamic> json) {
+    return GraphStats(
+      ts: json['ts'] as int,
+      eventsReceived: json['events_received'] as int,
+      symbolsResolved: json['symbols_resolved'] as int,
+      hexFallback: json['hex_fallback'] as int,
+      targetPid: json['target_pid'] as int?,
+      targetName: json['target_name'] as String?,
     );
   }
 }

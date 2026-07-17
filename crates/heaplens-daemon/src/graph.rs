@@ -298,6 +298,32 @@ impl OwnershipGraph {
         &self.nodes
     }
 
+    /// Observability-only: counts, across currently-live nodes, how many
+    /// resolve to a real symbol name vs. fall back to a hex address (or
+    /// have no locatable site at all). Reuses the exact same
+    /// `effective_site_index`/`name_for` computation `node_to_dto` already
+    /// does per node — this is a read-only aggregate over that, not a new
+    /// classification, so it cannot diverge from what the wire actually
+    /// sends. Exists so the Flutter target-diagnostics banner can tell
+    /// "unsymbolized target" apart from other zero-edge causes without
+    /// re-deriving the hex-prefix check per node itself.
+    pub fn symbol_stats(&self, resolver: &Resolver) -> (u64, u64) {
+        let mut resolved = 0u64;
+        let mut hex_fallback = 0u64;
+        for n in self.nodes.values().filter(|n| n.live) {
+            let is_hex = match Self::effective_site_index(&n.stack, n.stack_len, resolver) {
+                Some(i) => resolver.name_for(n.stack[i]).starts_with("0x"),
+                None => true,
+            };
+            if is_hex {
+                hex_fallback += 1;
+            } else {
+                resolved += 1;
+            }
+        }
+        (resolved, hex_fallback)
+    }
+
     fn node_to_dto(n: &Node, resolver: &Resolver) -> NodeDto {
         let symbol = Self::effective_site_index(&n.stack, n.stack_len, resolver)
             .map(|i| resolver.name_for(n.stack[i]))
@@ -312,6 +338,57 @@ impl OwnershipGraph {
             state: n.state.clone(),
             edges: n.edges_out.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod symbol_stats_tests {
+    use super::*;
+
+    /// Three live nodes: one with a resolved effective site, one whose
+    /// effective site address the resolver never learned (hex fallback),
+    /// and one with no locatable site at all (every frame classified as
+    /// machinery — also hex fallback, per `symbol_stats`'s doc comment). A
+    /// fourth, dead node is excluded entirely — `symbol_stats` only counts
+    /// live nodes, matching what `node_to_dto`/the wire actually reports for
+    /// the currently-visible graph.
+    #[test]
+    fn counts_resolved_vs_hex_fallback_across_live_nodes_only() {
+        let mut r = Resolver::new();
+        r.insert(0xAAA1, "myapp::resolved_site".to_owned(), false);
+        // 0xBBB1 is deliberately never inserted — name_for falls back to hex.
+        r.insert(0xCCC1, "alloc::vec::Vec<T>::with_capacity".to_owned(), true); // machinery only
+
+        let mut g = OwnershipGraph::new();
+
+        let mut resolved_stack = [0u64; 16];
+        resolved_stack[0] = 0xAAA1;
+        g.on_alloc(&AllocEvent::new(EventKind::Alloc, 0x1000, 0, 8, 8, 100, resolved_stack, 1), &r);
+
+        let mut hex_stack = [0u64; 16];
+        hex_stack[0] = 0xBBB1;
+        g.on_alloc(&AllocEvent::new(EventKind::Alloc, 0x2000, 0, 8, 8, 200, hex_stack, 1), &r);
+
+        let mut machinery_only_stack = [0u64; 16];
+        machinery_only_stack[0] = 0xCCC1;
+        g.on_alloc(&AllocEvent::new(EventKind::Alloc, 0x3000, 0, 8, 8, 300, machinery_only_stack, 1), &r);
+
+        // A fourth, now-dead node — must not be counted at all.
+        let mut dead_stack = [0u64; 16];
+        dead_stack[0] = 0xAAA1;
+        g.on_alloc(&AllocEvent::new(EventKind::Alloc, 0x4000, 0, 8, 8, 400, dead_stack, 1), &r);
+        g.on_dealloc(0x4000, 500);
+
+        let (resolved, hex_fallback) = g.symbol_stats(&r);
+        assert_eq!(resolved, 1, "only the truly-resolved live node should count as resolved");
+        assert_eq!(hex_fallback, 2, "unresolved-address and no-locatable-site live nodes both count as hex fallback");
+    }
+
+    #[test]
+    fn empty_graph_reports_zero_for_both_counts() {
+        let g = OwnershipGraph::new();
+        let r = Resolver::new();
+        assert_eq!(g.symbol_stats(&r), (0, 0));
     }
 }
 
