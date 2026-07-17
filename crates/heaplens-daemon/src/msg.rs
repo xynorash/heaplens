@@ -12,6 +12,11 @@ pub enum GraphMsg {
     Symbols(Vec<(u64, String, bool)>),
     /// Periodic tick from the timer — triggers drain_diff and log emission.
     Tick,
+    /// Forwarded from the pipe's HANDSHAKE frame (previously received and
+    /// discarded — see ingest.rs). Purely informational: pid/name are only
+    /// ever read to label the target-diagnostics banner, never by phi or
+    /// anomaly::sweep.
+    Handshake { pid: u64, name: String },
 }
 
 /// Request sent to the graph task when a new WebSocket client connects.

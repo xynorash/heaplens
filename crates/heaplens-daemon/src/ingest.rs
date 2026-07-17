@@ -55,8 +55,8 @@ pub async fn run(pipe_name: String, tx: mpsc::UnboundedSender<GraphMsg>) {
                             Frame::Symbols(syms) => {
                                 let _ = tx.send(GraphMsg::Symbols(syms));
                             }
-                            Frame::Handshake { .. } => {
-                                // Informational only — pid/process name not currently used.
+                            Frame::Handshake { pid, name } => {
+                                let _ = tx.send(GraphMsg::Handshake { pid, name });
                             }
                         }
                     }

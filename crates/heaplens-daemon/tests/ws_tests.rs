@@ -25,7 +25,7 @@ fn is_non_empty_diff(msg: &GraphMessage) -> bool {
         GraphMessage::Diff { add, update, remove, .. } => {
             !add.is_empty() || !update.is_empty() || !remove.is_empty()
         }
-        GraphMessage::Snapshot { .. } => false,
+        GraphMessage::Snapshot { .. } | GraphMessage::Stats { .. } => false,
     }
 }
 
@@ -52,6 +52,7 @@ async fn run_graph_loop(
                     }
                 }
                 Some(GraphMsg::Symbols(_)) => {}
+                Some(GraphMsg::Handshake { .. }) => {}
                 Some(GraphMsg::Tick) => {
                     let diff = graph.drain_diff(&resolver);
                     if is_non_empty_diff(&diff) {

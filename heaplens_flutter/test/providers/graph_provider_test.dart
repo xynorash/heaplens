@@ -187,6 +187,22 @@ void main() {
       expect(notifier.nodes.keys.toSet(), {1});
     });
 
+    test('a GraphStats message does not touch the node map or bump revision', () {
+      final notifier = container.read(graphProvider.notifier);
+      notifier.applyDiff(GraphDiff(ts: 1, add: [_node(id: 1)], update: [], remove: []));
+      expect(container.read(graphProvider), 1);
+
+      notifier.applyDiff(const GraphStats(
+        ts: 2,
+        eventsReceived: 10,
+        symbolsResolved: 5,
+        hexFallback: 1,
+      ));
+
+      expect(container.read(graphProvider), 1, reason: 'stats messages are not node data');
+      expect(notifier.nodes.keys.toSet(), {1});
+    });
+
     group('derived getters', () {
       test('orphanCount, liveNodeCount, totalLiveBytes computed on demand', () {
         final notifier = container.read(graphProvider.notifier);

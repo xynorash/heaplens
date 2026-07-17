@@ -64,10 +64,11 @@ async fn loopback_alloc_and_tick_produces_diff() {
                         assert!(owner.edges.contains(&child.id),
                             "owner should have child in edges");
                     }
-                    GraphMessage::Snapshot { .. } => panic!("expected Diff, got Snapshot"),
+                    other => panic!("expected Diff, got {other:?}"),
                 }
             }
             GraphMsg::Symbols(_) => {}
+            GraphMsg::Handshake { .. } => {}
         }
     }
 }
@@ -114,6 +115,7 @@ async fn loopback_dealloc_produces_remove() {
                 }
             }
             GraphMsg::Symbols(_) => {}
+            GraphMsg::Handshake { .. } => {}
         }
     }
 

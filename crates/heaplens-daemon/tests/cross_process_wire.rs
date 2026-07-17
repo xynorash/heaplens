@@ -152,6 +152,11 @@ async fn cross_process_wire_end_to_end() {
                             }
                         }
                     }
+                    // The real producer sends a HANDSHAKE frame on connect,
+                    // now forwarded by ingest.rs instead of discarded — this
+                    // must not be treated as end-of-stream by the catch-all
+                    // below (it isn't a connection close).
+                    Some(GraphMsg::Handshake { .. }) => continue,
                     _ => break,
                 },
                 req = connect_rx.recv() => {

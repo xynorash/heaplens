@@ -25,7 +25,7 @@ fn resolver_with_real_sites(sites: &[u64]) -> Resolver {
 fn unwrap_diff(msg: GraphMessage) -> (Vec<heaplens_protocol::NodeDto>, Vec<heaplens_protocol::NodeDto>, Vec<u64>) {
     match msg {
         GraphMessage::Diff { add, update, remove, .. } => (add, update, remove),
-        GraphMessage::Snapshot { .. } => panic!("expected Diff, got Snapshot"),
+        other => panic!("expected Diff, got {other:?}"),
     }
 }
 
