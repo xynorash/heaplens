@@ -709,6 +709,7 @@ freezed_annotation / json_annotation (+ build_runner, freezed, json_serializable
 - **No global mutable singletons with locks** on any hot path. Use channels + single-owner tasks.
 - **Time:** monotonic only (`Instant`), never wall-clock, for `ts_nanos`.
 - **Endianness:** little-endian on the wire (Windows/x86_64). State it; don't rely on native casts across the boundary beyond documented `repr(C)`.
+- **Adding a variant to `GraphMsg`, `GraphMessage`, or `Frame`:** grep the whole test suite for `match` on that enum and audit every `_ =>` (or otherwise non-exhaustive) arm. This has silently broken a real test three times (Symbols, then a control-target variant, then Handshake forwarding in `cross_process_wire.rs` — see `feat/target-diagnostics`): a new variant meets an old wildcard that was written when the enum had fewer cases, and the wildcard's fallback behavior (often `break`/treat-as-disconnect) fires for a message that's neither malformed nor a real end-of-stream. The compiler catches genuinely non-exhaustive `match`es; it cannot catch a `_ =>` arm silently swallowing a new case it was never written to expect.
 
 ---
 
