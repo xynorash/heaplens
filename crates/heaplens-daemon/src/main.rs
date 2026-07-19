@@ -7,13 +7,14 @@ use heaplens_daemon::{
     anomaly::{sweep, StormTracker},
     config::Config,
     graph::OwnershipGraph,
-    ingest,
-    msg::{ConnectRequest, GraphMsg, StoreMsg},
+    ingest, injector,
+    msg::{is_current_target_exit, ConnectRequest, GraphMsg, StoreMsg, TargetCmd},
+    procs,
     resolver::Resolver,
     server,
     store,
 };
-use heaplens_protocol::GraphMessage;
+use heaplens_protocol::{ControlResponse, GraphMessage};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -38,8 +39,18 @@ async fn main() -> anyhow::Result<()> {
     // 5. Connect-request channel (WS clients request snapshot + subscription).
     let (connect_tx, mut connect_rx) = mpsc::unbounded_channel::<ConnectRequest>();
 
+    // 5b. Target-control channel (Stage 7 §3: WS clients request process
+    //     list / attach / detach; the graph task is the single owner of both
+    //     graph state and "which pid is currently attached" session state).
+    let (target_tx, mut target_rx) = mpsc::unbounded_channel::<TargetCmd>();
+
+    // 5c. Control-push broadcast (Stage 7 §4.4): unprompted daemon→client
+    //     notifications, currently just `TargetExited`, mirroring the
+    //     existing graph-diff broadcast pattern rather than a request/reply.
+    let (control_push_tx, _) = broadcast::channel::<Arc<ControlResponse>>(16);
+
     // 6. WS server.
-    tokio::spawn(server::run(config.ws_addr.clone(), connect_tx));
+    tokio::spawn(server::run(config.ws_addr.clone(), connect_tx, target_tx, control_push_tx.clone()));
 
     // 7. Ingest channel.
     let (tx, mut rx) = mpsc::unbounded_channel::<GraphMsg>();
@@ -65,6 +76,9 @@ async fn main() -> anyhow::Result<()> {
     let mut resolver = Resolver::new();
     let mut storm_tracker = StormTracker::new();
     let mut warned_sites: std::collections::HashSet<u64> = std::collections::HashSet::new();
+
+    // 11. Attach-session state (Stage 7 §3.4: single target at a time).
+    let mut attached_pid: Option<u32> = None;
 
     // Graph loop — single-threaded owner of all graph state.
     loop {
@@ -95,6 +109,26 @@ async fn main() -> anyhow::Result<()> {
                 Some(GraphMsg::Symbols(syms)) => {
                     for (addr, name, is_machinery) in syms {
                         resolver.insert(addr, name, is_machinery);
+                    }
+                }
+                Some(GraphMsg::TargetConnected { pid, name }) => {
+                    info!("attach session confirmed: pid={pid} name={name}");
+                }
+                Some(GraphMsg::TargetDisconnected { pid }) => {
+                    // A pipe disconnect for the *currently tracked* pid means
+                    // that target exited. The pid check (not just "a pipe
+                    // closed") is load-bearing: during a target switch, the
+                    // old target's pipe-close event is detected
+                    // asynchronously by `ingest.rs` and can arrive after
+                    // `attached_pid` has already moved on to the newly
+                    // attached target. Without this check, that stale event
+                    // would incorrectly clear `attached_pid` and broadcast
+                    // `TargetExited` for the new target — which just
+                    // attached successfully and is still running.
+                    if is_current_target_exit(attached_pid, pid) {
+                        attached_pid = None;
+                        info!("target pid={pid} exited or disconnected");
+                        let _ = control_push_tx.send(Arc::new(ControlResponse::TargetExited { pid: pid as u32 }));
                     }
                 }
                 Some(GraphMsg::Tick) => {
@@ -131,6 +165,79 @@ async fn main() -> anyhow::Result<()> {
                     let diff_rx = broadcast_tx.subscribe();
                     let snapshot = graph.snapshot(&resolver);
                     let _ = reply.send((snapshot, diff_rx));
+                }
+            },
+            cmd = target_rx.recv() => {
+                match cmd {
+                    Some(TargetCmd::ListProcesses { reply }) => {
+                        // Process enumeration does per-process OpenProcess/
+                        // IsWow64Process2 syscalls (procs.rs) — run it off
+                        // this task so a slow system doesn't stall the graph
+                        // loop's other work while it walks the process list.
+                        let processes = tokio::task::spawn_blocking(procs::list_processes)
+                            .await
+                            .unwrap_or_default();
+                        let _ = reply.send(processes);
+                    }
+                    Some(TargetCmd::Attach { pid, reply }) => {
+                        // §3.4: clean single-target transition. Detach the
+                        // old target first (if any) before touching the new
+                        // one or the graph.
+                        if let Some(old_pid) = attached_pid.take() {
+                            if let Err(e) = injector::detach(old_pid).await {
+                                warn!("detach of previous target {old_pid} before switching failed: {e}");
+                                // Continue anyway — refusing to attach the
+                                // new target over an imperfect old detach
+                                // would strand the user with no way to
+                                // switch targets at all.
+                            }
+                        }
+
+                        // Clear graph state before attaching — a new
+                        // process is a new address space; merging
+                        // topologies across processes is nonsensical.
+                        // Broadcast the empty state immediately: diffs only
+                        // carry changes, so without this, already-connected
+                        // clients would keep showing the old target's stale
+                        // nodes until the new target's own first diff.
+                        graph = OwnershipGraph::new();
+                        resolver = Resolver::new();
+                        storm_tracker = StormTracker::new();
+                        warned_sites.clear();
+                        let empty = graph.snapshot(&resolver);
+                        let _ = broadcast_tx.send(Arc::new(empty));
+
+                        match injector::attach(pid).await {
+                            Ok(()) => {
+                                attached_pid = Some(pid);
+                                let _ = reply.send(Ok(()));
+                            }
+                            Err(e) => {
+                                let _ = reply.send(Err(e));
+                            }
+                        }
+                    }
+                    Some(TargetCmd::Detach { reply }) => {
+                        match attached_pid.take() {
+                            Some(pid) => match injector::detach(pid).await {
+                                Ok(()) => {
+                                    let _ = reply.send(Ok(()));
+                                }
+                                Err(e) => {
+                                    // Restore tracking so a retry (or the
+                                    // next attach's own detach-old step)
+                                    // can try again, rather than silently
+                                    // losing track of a still-live target.
+                                    attached_pid = Some(pid);
+                                    let _ = reply.send(Err(e));
+                                }
+                            },
+                            None => {
+                                let _ = reply.send(Ok(())); // idempotent no-op
+                            }
+                        }
+                    }
+                    None => {}
                 }
             },
             _ = tokio::signal::ctrl_c() => {

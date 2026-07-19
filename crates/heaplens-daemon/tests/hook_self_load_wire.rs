@@ -187,7 +187,14 @@ async fn hook_self_load_end_to_end() {
                     Some(GraphMsg::Events(events)) => {
                         raw_events_for_graph.lock().unwrap().extend(events);
                     }
-                    _ => break,
+                    Some(GraphMsg::TargetConnected { .. }) | Some(GraphMsg::TargetDisconnected { .. }) => {}
+                    // No Tick producer runs in this test, but matched
+                    // explicitly rather than folded into the wildcard below
+                    // — see cross_process_wire.rs's identical comment for
+                    // why (this is the same bug class that broke both files
+                    // when GraphMsg grew two new variants).
+                    Some(GraphMsg::Tick) => {}
+                    None => break,
                 },
                 _ = tokio::time::sleep(remaining) => break,
             }

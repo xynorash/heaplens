@@ -68,6 +68,7 @@ async fn loopback_alloc_and_tick_produces_diff() {
                 }
             }
             GraphMsg::Symbols(_) => {}
+            GraphMsg::TargetConnected { .. } | GraphMsg::TargetDisconnected { .. } => {}
         }
     }
 }
@@ -114,6 +115,7 @@ async fn loopback_dealloc_produces_remove() {
                 }
             }
             GraphMsg::Symbols(_) => {}
+            GraphMsg::TargetConnected { .. } | GraphMsg::TargetDisconnected { .. } => {}
         }
     }
 

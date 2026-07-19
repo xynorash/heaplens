@@ -274,6 +274,7 @@ dependencies = [
  "tokio-tungstenite",
  "tracing",
  "tracing-subscriber",
+ "windows-sys",
 ]
 
 [[package]]
@@ -283,6 +284,13 @@ dependencies = [
  "heaplens-alloc",
  "heaplens-protocol",
  "minhook",
+ "windows-sys",
+]
+
+[[package]]
+name = "heaplens-injector"
+version = "0.1.0"
+dependencies = [
  "windows-sys",
 ]
 
