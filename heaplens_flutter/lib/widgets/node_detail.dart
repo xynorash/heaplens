@@ -5,7 +5,9 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../models/node.dart';
 import '../providers/graph_provider.dart';
 import '../providers/selection_provider.dart';
+import '../theme/xynorash_theme.dart';
 import 'node_colors.dart';
+import 'ui_common.dart';
 
 /// Bounded ring-buffer capacity for the size-over-time sparkline.
 const int kSparklineCapacity = 120;
@@ -15,8 +17,8 @@ typedef SparklineSample = ({int ts, int size});
 
 /// Bounded ring buffer of [SparklineSample]s for a single node, keyed by
 /// that node's id. Exposed as its own class (rather than inlined private
-/// state in [NodeDetail]) so its reset/bound-growth behavior can be unit
-/// tested directly, without driving the whole widget tree.
+/// state) so its reset/bound-growth behavior can be unit tested directly,
+/// without driving a widget tree.
 class SparklineBuffer {
   int? _nodeId;
   final List<SparklineSample> _samples = [];
@@ -53,20 +55,18 @@ class SparklineBuffer {
   }
 }
 
-/// Side panel showing full detail for the currently selected node
-/// ([selectedNodeIdProvider]): symbol, ptr (hex), size, age, state, owner,
-/// edge count, and a size-over-time sparkline.
+/// The "Node detail" right-rail panel: full field detail for the currently
+/// selected node ([selectedNodeIdProvider]) — symbol, ptr (hex), size,
+/// age, state (as a plain-language color chip, paired with the raw state
+/// name via its tooltip), owner (id + ptr), edge count.
 ///
-/// Renders a placeholder when nothing is selected, or when the selected id
-/// no longer exists in the node map (e.g. it was removed by a `remove`
-/// diff) — never crashes on a stale selection.
+/// Renders an explicit [EmptyState] when nothing is selected, or when the
+/// selected id no longer exists in the node map (e.g. it was removed by a
+/// `remove` diff) — never crashes on a stale selection.
 ///
-/// This is a `StatefulWidget` (rather than adding a new Riverpod provider)
-/// because the sparkline ring buffer is transient, per-selection UI state
-/// that's naturally scoped to this widget's lifetime: it must reset the
-/// instant the selection changes, and nothing else in the app needs to read
-/// it. Keeping it local avoids adding provider surface for state with a
-/// single reader.
+/// The size-over-time sparkline is a separate right-rail panel
+/// ([NodeSparklinePanel]) per the UI refresh's panel grouping — this
+/// widget only renders the raw/technical field list.
 class NodeDetail extends ConsumerStatefulWidget {
   const NodeDetail({super.key});
 
@@ -75,11 +75,6 @@ class NodeDetail extends ConsumerStatefulWidget {
 }
 
 class _NodeDetailState extends ConsumerState<NodeDetail> {
-  /// Ring buffer of (ts, size) samples for the currently selected node.
-  /// Keyed/reset internally by [SparklineBuffer.record] whenever the node id
-  /// it's fed changes.
-  final SparklineBuffer _buffer = SparklineBuffer();
-
   /// Client-side rolling max of `ts` across all nodes ever seen, analogous
   /// to the daemon's own `max_ts_seen` (see graph.rs:
   /// `self.max_ts_seen = self.max_ts_seen.max(ev.ts_nanos)`). Monotonic --
@@ -98,95 +93,125 @@ class _NodeDetailState extends ConsumerState<NodeDetail> {
 
     if (selectedId == null || !nodes.containsKey(selectedId)) {
       // Selection cleared, or the selected node no longer exists in state
-      // (e.g. a `remove` diff deleted it) -- discard any stale buffer and
-      // show a placeholder rather than risk a null lookup.
+      // (e.g. a `remove` diff deleted it) -- show a placeholder rather than
+      // risk a null lookup.
+      return const EmptyState(message: 'no node selected', icon: Icons.touch_app_outlined);
+    }
+
+    final node = nodes[selectedId]!;
+
+    int scanMaxTs = node.ts;
+    NodeDto? owner;
+    for (final n in nodes.values) {
+      if (n.ts > scanMaxTs) scanMaxTs = n.ts;
+      if (n.edges.contains(selectedId)) owner = n;
+    }
+    _maxTsSeen = _maxTsSeen > scanMaxTs ? _maxTsSeen : scanMaxTs;
+    final age = _maxTsSeen - node.ts;
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Row(
+          children: [
+            Expanded(
+              // The symbol is a real code identifier (a resolved call-site
+              // name), not prose — monospace here too, same as the field
+              // values below, at a size that reads as a header.
+              child: Text(
+                node.symbol,
+                style: XynorashTheme.mono(fontSize: 15, fontWeight: FontWeight.bold),
+                overflow: TextOverflow.ellipsis,
+              ),
+            ),
+            NodeStateChip(state: node.state),
+          ],
+        ),
+        const SizedBox(height: 8),
+        _DetailRow('ptr', '0x${node.ptr.toRadixString(16)}'),
+        _DetailRow('size', '${node.size}', tooltip: 'Allocation size in bytes.'),
+        _DetailRow('age', '$age', tooltip: 'How long this allocation has been live, in producer-clock ticks.'),
+        _DetailRow('state', node.state.name, tooltip: kNodeStateDescriptions[node.state]!),
+        _DetailRow(
+          'owner',
+          owner == null ? 'none' : '${owner.id}',
+          trailing: owner == null ? null : '(0x${owner.ptr.toRadixString(16)})',
+          tooltip: 'The allocation that owns this one, if any.',
+        ),
+        _DetailRow('edges', '${node.edges.length}', tooltip: 'Number of allocations this node owns.'),
+      ],
+    );
+  }
+}
+
+/// The "Size over time" right-rail panel: a sparkline of the selected
+/// node's size history. Separate widget (and separate [SparklineBuffer]
+/// instance) from [NodeDetail] so the two can live in independent
+/// collapsible right-rail sections — both key off the same
+/// [selectedNodeIdProvider]/[graphProvider] state, so they stay in sync
+/// without any shared mutable state between them.
+class NodeSparklinePanel extends ConsumerStatefulWidget {
+  const NodeSparklinePanel({super.key});
+
+  @override
+  ConsumerState<NodeSparklinePanel> createState() => _NodeSparklinePanelState();
+}
+
+class _NodeSparklinePanelState extends ConsumerState<NodeSparklinePanel> {
+  final SparklineBuffer _buffer = SparklineBuffer();
+
+  @override
+  Widget build(BuildContext context) {
+    ref.watch(graphProvider);
+    final nodes = ref.read(graphProvider.notifier).nodes;
+    final selectedId = ref.watch(selectedNodeIdProvider);
+
+    if (selectedId == null || !nodes.containsKey(selectedId)) {
       _buffer.reset();
-      return const _NoSelectionPlaceholder();
+      return const EmptyState(message: 'no node selected', icon: Icons.show_chart);
     }
 
     final node = nodes[selectedId]!;
     _buffer.record(node);
 
-    int scanMaxTs = node.ts;
-    int? ownerId;
-    for (final n in nodes.values) {
-      if (n.ts > scanMaxTs) scanMaxTs = n.ts;
-      if (n.edges.contains(selectedId)) ownerId = n.id;
-    }
-    _maxTsSeen = _maxTsSeen > scanMaxTs ? _maxTsSeen : scanMaxTs;
-    final age = _maxTsSeen - node.ts;
-
-    return Padding(
-      padding: const EdgeInsets.all(12),
-      child: SingleChildScrollView(
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            Text(
-              node.symbol,
-              style: Theme.of(
-                context,
-              ).textTheme.titleMedium?.copyWith(fontWeight: FontWeight.bold),
-            ),
-            const SizedBox(height: 8),
-            _DetailRow('ptr', '0x${node.ptr.toRadixString(16)}'),
-            _DetailRow('size', '${node.size}'),
-            _DetailRow('age', '$age'),
-            _DetailRow('state', node.state.name),
-            _DetailRow('owner', ownerId == null ? 'none' : '$ownerId'),
-            _DetailRow('edges', '${node.edges.length}'),
-            const SizedBox(height: 16),
-            Text(
-              'size over time',
-              style: Theme.of(context).textTheme.labelMedium,
-            ),
-            const SizedBox(height: 8),
-            SizedBox(
-              height: 120,
-              child: _Sparkline(
-                samples: _buffer.samples,
-                color: colorForState(node.state),
-              ),
-            ),
-          ],
-        ),
-      ),
+    return SizedBox(
+      height: 120,
+      child: _Sparkline(samples: _buffer.samples, color: colorForState(node.state)),
     );
   }
 }
 
-class _NoSelectionPlaceholder extends StatelessWidget {
-  const _NoSelectionPlaceholder();
-
-  @override
-  Widget build(BuildContext context) {
-    return const Center(child: Text('no node selected'));
-  }
-}
-
 class _DetailRow extends StatelessWidget {
-  const _DetailRow(this.label, this.value);
+  const _DetailRow(this.label, this.value, {this.trailing, this.tooltip});
 
   final String label;
   final String value;
+  final String? trailing;
+  final String? tooltip;
 
   @override
   Widget build(BuildContext context) {
-    return Padding(
+    final row = Padding(
       padding: const EdgeInsets.symmetric(vertical: 2),
       child: Row(
         children: [
           SizedBox(
             width: 48,
-            child: Text(label, style: Theme.of(context).textTheme.bodySmall),
+            child: Text(label, style: const TextStyle(color: Colors.white54, fontSize: 11)),
           ),
-          Expanded(
-            child: Text(value, style: Theme.of(context).textTheme.bodyMedium),
-          ),
+          // Every field here — ptr, size, age, edge count — is raw data,
+          // not prose; monospace throughout the value column keeps them
+          // reading as data and keeps hex/decimal columns visually
+          // aligned run to run.
+          Expanded(child: Text(value, style: XynorashTheme.mono(fontSize: 12.5))),
+          if (trailing != null)
+            Text(trailing!, style: XynorashTheme.mono(fontSize: 11, color: Colors.white54)),
         ],
       ),
     );
+    if (tooltip == null) return row;
+    return Tooltip(message: tooltip!, child: row);
   }
 }
 
@@ -198,16 +223,37 @@ class _Sparkline extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    if (samples.length < 2) {
+    if (samples.isEmpty) {
       return const Center(child: Text('collecting data...'));
     }
-    final spots = <FlSpot>[
-      for (var i = 0; i < samples.length; i++)
-        FlSpot(i.toDouble(), samples[i].size.toDouble()),
-    ];
+    // A node whose size genuinely never changes only ever produces one
+    // deduplicated sample (SparklineBuffer.record dedupes consecutive
+    // same-size updates) — that used to fall into the same "collecting
+    // data..." branch as zero samples and never resolve, since a
+    // single-point line has nothing to interpolate between. That's not
+    // "still collecting", it's a real, final answer: this allocation's
+    // size has been constant since it appeared. Render it as a flat line
+    // at that one value instead of leaving the panel looking broken.
+    final spots = samples.length == 1
+        ? [
+            FlSpot(0, samples[0].size.toDouble()),
+            FlSpot(1, samples[0].size.toDouble()),
+          ]
+        : [
+            for (var i = 0; i < samples.length; i++)
+              FlSpot(i.toDouble(), samples[i].size.toDouble()),
+          ];
     return LineChart(
       LineChartData(
-        titlesData: const FlTitlesData(show: false),
+        titlesData: const FlTitlesData(
+          show: true,
+          leftTitles: AxisTitles(
+            sideTitles: SideTitles(showTitles: true, reservedSize: 40),
+          ),
+          bottomTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
+          topTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
+          rightTitles: AxisTitles(sideTitles: SideTitles(showTitles: false)),
+        ),
         gridData: const FlGridData(show: false),
         borderData: FlBorderData(show: false),
         lineTouchData: const LineTouchData(enabled: false),

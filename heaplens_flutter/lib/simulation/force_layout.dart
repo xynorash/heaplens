@@ -4,11 +4,18 @@ import 'package:vector_math/vector_math.dart' show Vector2;
 
 import '../models/node.dart';
 
-/// Minimum/maximum on-screen radius (px) for a [SimNode], derived from
-/// `sqrt(size)` and clamped into this range so both tiny and huge
-/// allocations stay legible on the canvas.
-const double kMinNodeRadius = 4.0;
-const double kMaxNodeRadius = 40.0;
+/// Minimum/maximum on-screen radius (px) for a [SimNode]. See
+/// [radiusForSize] for how a `NodeDto.size` maps into this range.
+const double kMinNodeRadius = 5.0;
+const double kMaxNodeRadius = 38.0;
+
+/// Reference allocation size (bytes) that maps to [kMaxNodeRadius] in
+/// [radiusForSize]'s log curve — 1 MiB. Not a hard ceiling: any size at or
+/// above this still renders at [kMaxNodeRadius] (the curve clamps), it's
+/// just the point past which growing further stops being visually
+/// distinguishable, which is the right trade-off for a graph where
+/// "there's a big one here" matters more than precisely how big.
+const double kLargeSizeReference = 1024 * 1024;
 
 /// Rest length (px) of the spring connecting an owner node to an owned node
 /// along a graph edge.
@@ -22,8 +29,34 @@ const double kSpringStrength = 0.06;
 const double kRepulsionStrength = 3000.0;
 
 /// Gentle pull toward the canvas center so disconnected components don't
-/// drift off-screen forever.
-const double kGravityStrength = 0.02;
+/// drift off-screen forever. Kept low deliberately — enough to hold the
+/// graph on-screen, not enough to fight the collision pass and pile
+/// disconnected roots back into a clump. See [_resolveCollisions] for the
+/// hard no-overlap guarantee; gravity's only job is staying on-canvas.
+const double kGravityStrength = 0.012;
+
+/// Floor (px) on the repulsion gap (`distance - (r_i + r_j)`) used as the
+/// denominator in [ForceLayout._applyForces]'s repulsion force. Without
+/// this, two nodes whose *edges* are touching or overlapping (gap near
+/// zero or negative) would produce a force approaching or crossing
+/// infinity — this clamps the closest-range repulsion to a large but
+/// finite push instead of a blowup, and lets [_resolveCollisions] (a hard
+/// positional constraint, not a force) do the actual no-overlap work.
+const double kMinRepulsionGap = 2.0;
+
+/// Minimum gap (px) [_resolveCollisions] maintains between two drawn
+/// circles' edges — nodes rest near but not touching.
+const double kCollisionMargin = 3.0;
+
+/// Side length (px) of the spatial-hash grid cell used by
+/// [ForceLayout._resolveCollisions]. Sized to `2 * kMaxNodeRadius +
+/// kCollisionMargin` so that any pair of nodes close enough to overlap
+/// (their radii sum is at most `2 * kMaxNodeRadius`) always falls within
+/// one cell of each other — checking a node's own cell plus its 8
+/// neighbors is therefore guaranteed to find every real collision
+/// candidate, without an O(n^2) all-pairs scan.
+const double kCollisionCellSize =
+    kMaxNodeRadius * 2 + kCollisionMargin;
 
 /// Per-step velocity damping factor, applied multiplicatively every
 /// [ForceLayout.step].
@@ -59,9 +92,27 @@ const int kAggregationExitThreshold = 450;
 /// center when there is no positioned owner.
 const double kSpawnJitter = 20.0;
 
-/// Radius (px) for a `NodeDto.size`, clamped to [kMinNodeRadius]..[kMaxNodeRadius].
-double radiusForSize(int size) =>
-    math.sqrt(size.toDouble()).clamp(kMinNodeRadius, kMaxNodeRadius);
+/// Radius (px) for a `NodeDto.size`, clamped to
+/// [kMinNodeRadius]..[kMaxNodeRadius].
+///
+/// Log-scaled, not `sqrt`-scaled. This is a real fix, not a cosmetic
+/// tweak: the allocation sizes this app actually renders span bytes to
+/// low kilobytes (every workload used throughout this project's own
+/// testing — 1 to a few hundred bytes), and `sqrt` barely moves for that
+/// range (`sqrt(500) ≈ 22`, `sqrt(32) ≈ 6`) while a handful of larger
+/// outliers blow straight through to the clamp — the result was almost
+/// every real node pinned near [kMinNodeRadius] with occasional maxed-out
+/// blobs, not a readable size gradient. `log2` compresses the *whole*
+/// realistic byte-to-megabyte range into the same pixel budget evenly:
+/// each doubling of size is the same visual step, so a 32-byte node, a
+/// 500-byte node, and a 64KB node are all clearly, proportionately
+/// distinguishable instead of nearly all clustering at the floor.
+double radiusForSize(int size) {
+  if (size <= 0) return kMinNodeRadius;
+  final t = (math.log(size + 1) / math.ln2) / (math.log(kLargeSizeReference + 1) / math.ln2);
+  return (kMinNodeRadius + (kMaxNodeRadius - kMinNodeRadius) * t)
+      .clamp(kMinNodeRadius, kMaxNodeRadius);
+}
 
 /// Physical state of one node (or, once aggregated, one symbol-bucket) on
 /// the force-directed canvas.
@@ -293,6 +344,7 @@ class ForceLayout {
   void step(double dt) {
     _syncAggregation();
     _applyForces(dt);
+    _resolveCollisions();
     _advanceFades(dt);
   }
 
@@ -465,13 +517,22 @@ class ForceLayout {
 
     final forces = <int, Vector2>{for (final id in ids) id: Vector2.zero()};
 
-    // Pairwise repulsion, O(n^2).
+    // Pairwise repulsion, O(n^2). Radius-aware: computed from the gap
+    // between drawn *edges* (distance - (r_i + r_j)), not center-to-center
+    // distance. A point-distance model treats two big nodes whose circles
+    // already overlap as "far enough" once their centers clear a fixed
+    // distance — this is the root cause of the reported blob overlap.
+    // Using the edge gap means big nodes push each other apart based on
+    // their actual drawn size, and small nodes don't get placed inside a
+    // large one just because their centers are far enough apart on paper.
     for (var i = 0; i < ids.length; i++) {
       final aId = ids[i];
-      final aPos = simNodes[aId]!.position;
+      final aSim = simNodes[aId]!;
+      final aPos = aSim.position;
       for (var j = i + 1; j < ids.length; j++) {
         final bId = ids[j];
-        final bPos = simNodes[bId]!.position;
+        final bSim = simNodes[bId]!;
+        final bPos = bSim.position;
         var delta = aPos - bPos;
         var distSq = delta.length2;
         if (distSq < 0.0001) {
@@ -485,7 +546,14 @@ class ForceLayout {
         }
         final dist = math.sqrt(distSq);
         final dir = delta / dist;
-        final forceMag = kRepulsionStrength / distSq;
+        final gap = dist - (aSim.radius + bSim.radius);
+        // Clamped against blowups: two big overlapping nodes have a small
+        // or negative gap, which would otherwise send forceMag toward (or
+        // past) infinity. kMinRepulsionGap floors the denominator instead
+        // — a large but finite push. The hard "never actually overlap"
+        // guarantee is `_resolveCollisions`, not this force.
+        final effectiveGap = math.max(gap, kMinRepulsionGap);
+        final forceMag = kRepulsionStrength / (effectiveGap * effectiveGap);
         forces[aId] = forces[aId]! + dir * forceMag;
         forces[bId] = forces[bId]! + dir * -forceMag;
       }
@@ -526,6 +594,105 @@ class ForceLayout {
       sim.velocity = (sim.velocity + forces[id]! * dt) * kVelocityDamping;
       sim.position = sim.position + sim.velocity * dt;
     }
+  }
+
+  /// Hard no-overlap guarantee, run once per [step] after force integration.
+  ///
+  /// [_applyForces]'s repulsion is a *soft* force — like any spring/repel
+  /// system it can settle into equilibrium with circles still overlapping
+  /// (this is exactly the reported "blob" bug: disconnected nodes have no
+  /// spring pulling them apart, so soft repulsion alone can leave them
+  /// resting edge-into-edge or worse). This pass directly displaces any
+  /// pair of nodes whose drawn circles are closer than
+  /// `r_i + r_j + kCollisionMargin`, splitting the correction by inverse
+  /// radius (the larger node barely moves; the smaller one does most of
+  /// the moving) so a big owner node isn't shoved around by a swarm of
+  /// tiny children.
+  ///
+  /// Uses a spatial-hash grid rather than an O(n^2) all-pairs scan: cell
+  /// size is `2 * kMaxNodeRadius + kCollisionMargin` (see
+  /// [kCollisionCellSize]'s doc for why that size guarantees correctness),
+  /// so only same-cell and the 8 neighboring cells are ever checked per
+  /// node — O(n·k) where k is the local node density, not O(n^2). Stays
+  /// smooth at the ~200 visible nodes this is sized for; the existing
+  /// >500 aggregation threshold (ENF9) still caps individual-mode node
+  /// count above that.
+  void _resolveCollisions() {
+    final ids = simNodes.keys.toList(growable: false);
+    if (ids.length < 2) return;
+
+    final grid = <int, List<int>>{};
+    int cellIndex(double x, double y) {
+      final cx = (x / kCollisionCellSize).floor();
+      final cy = (y / kCollisionCellSize).floor();
+      // Pack two cell coordinates into one int key. Offset by a large
+      // constant first so negative cell coordinates (nodes can drift to
+      // either side of the canvas origin) never collide with positive
+      // ones after packing.
+      const offset = 1 << 20;
+      return (cx + offset) * (1 << 21) + (cy + offset);
+    }
+
+    for (final id in ids) {
+      final pos = simNodes[id]!.position;
+      grid.putIfAbsent(cellIndex(pos.x, pos.y), () => <int>[]).add(id);
+    }
+
+    for (final id in ids) {
+      final sim = simNodes[id]!;
+      final cx = (sim.position.x / kCollisionCellSize).floor();
+      final cy = (sim.position.y / kCollisionCellSize).floor();
+      for (var dx = -1; dx <= 1; dx++) {
+        for (var dy = -1; dy <= 1; dy++) {
+          const offset = 1 << 20;
+          final key =
+              (cx + dx + offset) * (1 << 21) + (cy + dy + offset);
+          final bucket = grid[key];
+          if (bucket == null) continue;
+          for (final otherId in bucket) {
+            // Process each unordered pair exactly once regardless of
+            // which cell/neighbor-offset combination finds it first.
+            if (otherId <= id) continue;
+            _separatePair(id, otherId);
+          }
+        }
+      }
+    }
+  }
+
+  void _separatePair(int aId, int bId) {
+    final a = simNodes[aId];
+    final b = simNodes[bId];
+    if (a == null || b == null) return;
+
+    final delta = a.position - b.position;
+    var dist = delta.length;
+    final minDist = a.radius + b.radius + kCollisionMargin;
+    if (dist >= minDist) return; // not overlapping, nothing to do
+
+    Vector2 dir;
+    if (dist < 0.0001) {
+      // Exactly coincident: pick a deterministic-ish direction so both
+      // still move apart rather than the correction being undefined.
+      dir = Vector2(
+        (_random.nextDouble() * 2 - 1) * 0.5 + 0.5,
+        (_random.nextDouble() * 2 - 1) * 0.5,
+      ).normalized();
+      dist = 0.0001;
+    } else {
+      dir = delta / dist;
+    }
+
+    final overlap = minDist - dist;
+    // Inverse-size weighting: a node's own share of the correction is
+    // proportional to the *other* node's radius, so the bigger of the two
+    // barely moves and the smaller one does most of the separating.
+    final totalRadius = a.radius + b.radius;
+    final aShare = totalRadius > 0 ? b.radius / totalRadius : 0.5;
+    final bShare = totalRadius > 0 ? a.radius / totalRadius : 0.5;
+
+    a.position = a.position + dir * (overlap * aShare);
+    b.position = b.position - dir * (overlap * bShare);
   }
 
   void _advanceFades(double dt) {

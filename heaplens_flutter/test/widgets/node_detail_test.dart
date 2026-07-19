@@ -67,7 +67,7 @@ void main() {
     addTearDown(() => controller.close());
     await _pumpNodeDetail(tester, controller);
 
-    expect(find.text('no node selected'), findsOneWidget);
+    expect(find.text('> no node selected'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 
@@ -93,7 +93,7 @@ void main() {
         );
     await tester.pump();
 
-    expect(find.text('no node selected'), findsOneWidget);
+    expect(find.text('> no node selected'), findsOneWidget);
     expect(tester.takeException(), isNull);
   });
 

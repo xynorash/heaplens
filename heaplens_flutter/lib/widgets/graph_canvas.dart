@@ -7,6 +7,7 @@ import '../providers/filter_providers.dart';
 import '../providers/graph_provider.dart';
 import '../providers/selection_provider.dart';
 import '../simulation/force_layout.dart';
+import '../theme/xynorash_theme.dart';
 import 'node_colors.dart';
 
 /// Rendering-only filter check shared by [GraphCanvas]'s paint/hit-test path
@@ -64,6 +65,13 @@ class GraphCanvas extends ConsumerStatefulWidget {
 class _GraphCanvasState extends ConsumerState<GraphCanvas>
     with SingleTickerProviderStateMixin {
   late final AnimationController _pulseController;
+  final TransformationController _transformController = TransformationController();
+
+  static const double _minScale = 0.5;
+  static const double _maxScale = 3.0;
+  static const double _zoomStep = 1.25;
+
+  double get _currentScale => _transformController.value.getMaxScaleOnAxis();
 
   @override
   void initState() {
@@ -77,7 +85,35 @@ class _GraphCanvasState extends ConsumerState<GraphCanvas>
   @override
   void dispose() {
     _pulseController.dispose();
+    _transformController.dispose();
     super.dispose();
+  }
+
+  void _zoom(double factor) {
+    final target = (_currentScale * factor).clamp(_minScale, _maxScale);
+    final applied = target / _currentScale;
+    if (applied == 1.0) return;
+    // Anchor the zoom on the current viewport center (not the canvas
+    // origin) so zooming in/out feels like it's centered on what's
+    // actually visible, rather than dragging everything toward the
+    // virtual canvas's top-left corner.
+    final viewportSize = context.size ?? Size.zero;
+    final centerViewport = Offset(viewportSize.width / 2, viewportSize.height / 2);
+    final centerScene = _transformController.toScene(centerViewport);
+    final updated = _transformController.value.clone()
+      ..translateByDouble(centerScene.dx, centerScene.dy, 0, 1)
+      ..scaleByDouble(applied, applied, applied, 1)
+      ..translateByDouble(-centerScene.dx, -centerScene.dy, 0, 1);
+    setState(() => _transformController.value = updated);
+  }
+
+  void _resetZoom() {
+    // Restore the centered view (gravity well at viewport center), not
+    // raw identity — identity would snap back to the same off-center
+    // position `_scheduleInitialCentering` exists to fix.
+    setState(
+      () => _transformController.value = _initialTransform ?? Matrix4.identity(),
+    );
   }
 
   void _handleTapUp(TapUpDetails details, BoxConstraints constraints) {
@@ -147,32 +183,175 @@ class _GraphCanvasState extends ConsumerState<GraphCanvas>
           entry.key: entry.value,
     };
 
+    // The canvas is a fixed virtual size, larger than any typical viewport,
+    // panned via InteractiveViewer rather than clipped to whatever screen
+    // space happens to be available — previously the CustomPaint was sized
+    // to exactly the viewport (`constraints.biggest`), so any node the
+    // force layout pushed outside that rectangle was simply unreachable:
+    // clipped, with no way to scroll to it. `constrained: false` lets the
+    // child be genuinely bigger than the viewport; `panEnabled: true` gives
+    // free two-axis panning. `scaleEnabled: false` disables *gesture*
+    // zoom (pinch/trackpad/scroll-wheel) specifically — zoom is driven
+    // only by the explicit +/-/reset buttons below, via
+    // `_transformController`, so it stays predictable and doesn't fight
+    // two-axis panning gestures. `minScale`/`maxScale` still have to match
+    // the buttons' own clamp range: InteractiveViewer clamps any value
+    // assigned to its controller into its own configured bounds, so
+    // leaving these at 1.0/1.0 (as when zoom was out of scope) would
+    // silently discard the buttons' work.
     return RepaintBoundary(
       child: LayoutBuilder(
-        builder: (context, constraints) {
-          return GestureDetector(
-            onTapUp: (details) => _handleTapUp(details, constraints),
-            child: AnimatedBuilder(
-              animation: _pulseController,
-              builder: (context, _) {
-                return CustomPaint(
-                  key: const Key('graphCanvasPaint'),
-                  size: constraints.biggest,
-                  painter: GraphPainter(
-                    simNodes: widget.layout.simNodes,
-                    nodes: visibleNodes,
-                    pulseValue: _pulseController.value,
-                    selectedId: selectedId,
-                  ),
-                );
-              },
-            ),
-          );
+        builder: (context, viewportConstraints) {
+          _scheduleCentering(viewportConstraints.biggest);
+          return _buildViewer(viewportConstraints, visibleNodes, selectedId);
         },
       ),
     );
   }
+
+  /// The force layout's gravity well sits at a fixed point
+  /// ([ForceLayout.centerX]/`centerY`, not viewport-relative) — on a wide
+  /// window, that point can be much closer to the virtual canvas's left
+  /// edge than the actual visible viewport's center, so the graph reads
+  /// as pushed left instead of centered (confirmed against a real
+  /// screenshot: a ~1540px-wide graph area with the gravity well fixed at
+  /// x=400 put the whole cluster in roughly the left quarter of the
+  /// space).
+  ///
+  /// Originally this only centered once, on first layout — but resizing
+  /// the window afterward left the *old* fixed pixel offset in place, so
+  /// growing the window drifted the graph back off-center (the offset
+  /// that centered a 1540px-wide viewport doesn't center a 1900px-wide
+  /// one). Fixed: re-run whenever the viewport's *size actually changes*
+  /// (tracked via [_lastCenteredSize]), not just on the first build. This
+  /// does mean a resize re-centers the view even if the user had panned
+  /// away from center — a deliberate trade-off (predictable centering on
+  /// resize, matching what was asked for) over preserving an arbitrary
+  /// pan position across a size change.
+  Size? _lastCenteredSize;
+  Matrix4? _initialTransform;
+
+  void _scheduleCentering(Size viewportSize) {
+    if (viewportSize.isEmpty || viewportSize == _lastCenteredSize) return;
+    _lastCenteredSize = viewportSize;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) return;
+      final dx = viewportSize.width / 2 - widget.layout.centerX;
+      final dy = viewportSize.height / 2 - widget.layout.centerY;
+      final transform = Matrix4.translationValues(dx, dy, 0);
+      _initialTransform = transform;
+      setState(() => _transformController.value = transform);
+    });
+  }
+
+  Widget _buildViewer(
+    BoxConstraints viewportConstraints,
+    Map<int, NodeDto> visibleNodes,
+    int? selectedId,
+  ) {
+    return Stack(
+        children: [
+          InteractiveViewer(
+            key: const Key('graphScrollView'),
+            transformationController: _transformController,
+            constrained: false,
+            panEnabled: true,
+            scaleEnabled: false,
+            boundaryMargin: const EdgeInsets.all(400),
+            minScale: _minScale,
+            maxScale: _maxScale,
+            child: SizedBox(
+              width: kGraphVirtualWidth,
+              height: kGraphVirtualHeight,
+              child: LayoutBuilder(
+                builder: (context, constraints) {
+                  return GestureDetector(
+                    onTapUp: (details) => _handleTapUp(details, constraints),
+                    child: AnimatedBuilder(
+                      animation: _pulseController,
+                      builder: (context, _) {
+                        return CustomPaint(
+                          key: const Key('graphCanvasPaint'),
+                          size: constraints.biggest,
+                          painter: GraphPainter(
+                            simNodes: widget.layout.simNodes,
+                            nodes: visibleNodes,
+                            pulseValue: _pulseController.value,
+                            selectedId: selectedId,
+                          ),
+                        );
+                      },
+                    ),
+                  );
+                },
+              ),
+            ),
+          ),
+          Positioned(
+            right: 12,
+            bottom: 12,
+            child: _ZoomControls(
+              onZoomIn: () => _zoom(_zoomStep),
+              onZoomOut: () => _zoom(1 / _zoomStep),
+              onReset: _resetZoom,
+            ),
+          ),
+        ],
+      );
+  }
 }
+
+class _ZoomControls extends StatelessWidget {
+  const _ZoomControls({required this.onZoomIn, required this.onZoomOut, required this.onReset});
+
+  final VoidCallback onZoomIn;
+  final VoidCallback onZoomOut;
+  final VoidCallback onReset;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      decoration: BoxDecoration(
+        color: Colors.black.withValues(alpha: 0.55),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: Colors.white24),
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          IconButton(
+            key: const Key('zoomInButton'),
+            tooltip: 'Zoom in',
+            icon: const Icon(Icons.add, size: 18, color: Colors.white70),
+            onPressed: onZoomIn,
+          ),
+          IconButton(
+            key: const Key('zoomOutButton'),
+            tooltip: 'Zoom out',
+            icon: const Icon(Icons.remove, size: 18, color: Colors.white70),
+            onPressed: onZoomOut,
+          ),
+          IconButton(
+            key: const Key('zoomResetButton'),
+            tooltip: 'Reset zoom',
+            icon: const Icon(Icons.center_focus_strong, size: 18, color: Colors.white70),
+            onPressed: onReset,
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// Virtual canvas dimensions the graph is painted onto — generously larger
+/// than a typical window so a spread-out simulation (many disconnected
+/// roots, per the overlap fix) has real room, panned into view via
+/// [InteractiveViewer] rather than clipped. [ForceLayout]'s default
+/// gravity well sits at (400, 300); these are sized well beyond that in
+/// both directions so the graph can spread without immediately hitting an
+/// edge.
+const double kGraphVirtualWidth = 1600;
+const double kGraphVirtualHeight = 1200;
 
 /// Paints edges (thin, low-alpha strokes) followed by nodes (colored by
 /// [NodeDto.state], with a pulsing ring for `orphan` and fade-driven alpha
@@ -200,10 +379,22 @@ class GraphPainter extends CustomPainter {
 
   final int? selectedId;
 
+  // Circuit-trace tinted, not plain white — ties the graph's own edges
+  // into the same cyan HUD signal color as everything else, instead of a
+  // generic neutral line.
   static final Paint _edgePaint = Paint()
-    ..color = const Color(0x33FFFFFF)
+    ..color = XynorashTheme.cyan.withValues(alpha: 0.16)
     ..strokeWidth = 1.0
     ..style = PaintingStyle.stroke;
+
+  static final Paint _gridPaint = Paint()
+    ..color = XynorashTheme.cyan.withValues(alpha: 0.035)
+    ..strokeWidth = 1.0;
+
+  /// Spacing (px) of the faint background HUD grid — a scale reference for
+  /// the canvas, the same reason a cockpit display or oscilloscope grids
+  /// its background, not decoration for its own sake.
+  static const double _gridSpacing = 48.0;
 
   /// Wall-clock time of the most recent [paint] call. Diagnostic-only (see
   /// `debug_overlay.dart`, fix/canvas-render branch): lets an on-screen
@@ -214,8 +405,18 @@ class GraphPainter extends CustomPainter {
   @override
   void paint(Canvas canvas, Size size) {
     lastPaintAt = DateTime.now();
+    _paintGrid(canvas, size);
     _paintEdges(canvas);
     _paintNodes(canvas);
+  }
+
+  void _paintGrid(Canvas canvas, Size size) {
+    for (var x = 0.0; x < size.width; x += _gridSpacing) {
+      canvas.drawLine(Offset(x, 0), Offset(x, size.height), _gridPaint);
+    }
+    for (var y = 0.0; y < size.height; y += _gridSpacing) {
+      canvas.drawLine(Offset(0, y), Offset(size.width, y), _gridPaint);
+    }
   }
 
   void _paintEdges(Canvas canvas) {
@@ -244,9 +445,18 @@ class GraphPainter extends CustomPainter {
       final center = Offset(sim.position.x, sim.position.y);
       final baseColor = colorForState(node.state);
       final alpha = node.state == NodeStateDto.freed ? sim.fade : 1.0;
+      final clampedAlpha = alpha.clamp(0.0, 1.0);
 
-      final fillPaint = Paint()
-        ..color = baseColor.withValues(alpha: alpha.clamp(0.0, 1.0));
+      // Soft neon bloom behind the node — a blurred, larger, dimmer copy
+      // of the fill color underneath the crisp circle. This is what turns
+      // "a filled circle" into "a HUD blip"; drawn first so the crisp
+      // fill on top stays sharp.
+      final glowPaint = Paint()
+        ..color = baseColor.withValues(alpha: 0.30 * clampedAlpha)
+        ..maskFilter = MaskFilter.blur(BlurStyle.normal, sim.radius * 0.55);
+      canvas.drawCircle(center, sim.radius * 1.1, glowPaint);
+
+      final fillPaint = Paint()..color = baseColor.withValues(alpha: clampedAlpha);
       canvas.drawCircle(center, sim.radius, fillPaint);
 
       if (node.state == NodeStateDto.orphan) {
@@ -262,10 +472,24 @@ class GraphPainter extends CustomPainter {
       }
 
       if (id == selectedId) {
+        // Selection ring glows cyan (the app's own "this is active" HUD
+        // signal color) rather than plain white, so a selected node reads
+        // as "focused" the same way a focused control does everywhere
+        // else in the app.
+        final selectionGlow = Paint()
+          ..color = XynorashTheme.cyan.withValues(alpha: 0.5)
+          ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 4);
+        canvas.drawCircle(
+          center,
+          sim.radius + 3,
+          selectionGlow
+            ..style = PaintingStyle.stroke
+            ..strokeWidth = 2.0,
+        );
         final selectionPaint = Paint()
-          ..color = Colors.white
+          ..color = XynorashTheme.cyan
           ..style = PaintingStyle.stroke
-          ..strokeWidth = 2.0;
+          ..strokeWidth = 1.6;
         canvas.drawCircle(center, sim.radius + 3, selectionPaint);
       }
     }

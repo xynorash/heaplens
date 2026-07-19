@@ -1,6 +1,5 @@
 import 'dart:async';
 
-import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
@@ -10,13 +9,16 @@ import '../providers/graph_provider.dart';
 import '../providers/ws_provider.dart';
 import '../widgets/graph_canvas.dart' show GraphPainter;
 
-/// Whether [DebugOverlay] should be built. On by default in debug builds;
-/// can be forced on in a release/profile build via
-/// `--dart-define=HEAPLENS_DEBUG_OVERLAY=true` — useful precisely for
-/// investigating a symptom (like a blank canvas) that might not reproduce
-/// under `flutter run`'s debug-mode overhead.
-const bool kShowDebugOverlay =
-    kDebugMode || bool.fromEnvironment('HEAPLENS_DEBUG_OVERLAY');
+/// Whether [DebugOverlay] should be built. Opt-in only, via
+/// `--dart-define=HEAPLENS_DEBUG_OVERLAY=true` — this used to also default
+/// on for every debug build, which meant the floating stats box (green
+/// monospace text, bottom-right of the graph) was effectively always
+/// visible in normal dev usage and duplicated the right rail's own
+/// "Connection & render stats" panel. The overlay itself (and its
+/// diagnostic value for investigating a symptom that might not reproduce
+/// under `flutter run`'s debug-mode overhead) is unchanged — it just no
+/// longer turns itself on unasked.
+const bool kShowDebugOverlay = bool.fromEnvironment('HEAPLENS_DEBUG_OVERLAY');
 
 /// Standing on-screen diagnostic instrument (added for the fix/canvas-render
 /// investigation; kept for every future visual gate, not removed once this

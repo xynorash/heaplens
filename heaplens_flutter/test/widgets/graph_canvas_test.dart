@@ -367,11 +367,14 @@ void main() {
       ),
     );
 
-    // Empty provider: nothing to paint. If a future change makes the
-    // painter draw a background/border regardless of data, tighten this to
-    // check circle-count specifically rather than "no draw calls at all".
+    // Empty provider: no *nodes* to paint. The painter now always draws a
+    // faint background HUD grid regardless of data (see graph_canvas.dart
+    // `_paintGrid` — a persistent scale reference, not conditional on
+    // there being anything to show), so "paints nothing at all" is no
+    // longer the right assertion; tightened to "paints no circles" per
+    // this test's own original guidance above.
     await tester.pump();
-    expect(find.byKey(const Key('graphCanvasPaint')), paintsNothing);
+    expect(find.byKey(const Key('graphCanvasPaint')), isNot(paints..circle()));
 
     // Populate: the painter must now actually issue a drawCircle call for
     // the live node. This is the assertion class that would have caught a
