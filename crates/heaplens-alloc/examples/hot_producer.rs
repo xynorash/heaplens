@@ -19,10 +19,18 @@ fn leaf_alloc(n: usize) -> Vec<u8> {
 /// default threshold 32) is purely structural — no time window, no waiting
 /// on `tau_ms` — so the owner should flip to Hot (amber) as soon as phi has
 /// attached all `n_children` to it, well before the hold period ends.
+///
+/// As in `demo_producer.rs`'s `make_family`, `children`'s own backing
+/// storage (`Vec::with_capacity`) must be allocated *before* `owner`: it
+/// allocates at this same call site, so it is also a same-symbol candidate
+/// phi's recency tie-break considers for each child. Allocated after
+/// `owner`, it would win that tie-break and every child would attach to the
+/// children container instead of to `owner` — the container would flip Hot,
+/// not the node actually meant to be observed.
 #[inline(never)]
 fn make_star(n_children: usize) -> (Vec<u8>, Vec<Vec<u8>>) {
-    let owner = vec![0u8; 4096];
     let mut children = Vec::with_capacity(n_children);
+    let owner = vec![0u8; 4096];
     for _ in 0..n_children {
         children.push(leaf_alloc(128));
     }
