@@ -8,10 +8,24 @@ pub mod capture;
 pub mod writer;
 
 use std::alloc::{GlobalAlloc, Layout, System};
-use std::sync::Once;
+use std::sync::{Mutex, Once};
 use std::sync::atomic::{AtomicBool, Ordering};
 use heaplens_protocol::EventKind;
 use heaplens_protocol::AllocEvent;
+
+/// Serializes every call into `backtrace`'s Windows backend — both
+/// `capture::capture_stack`'s `trace_unsynchronized` (called from every
+/// allocating thread, on the hot path) and `writer::run`'s `resolve` calls
+/// (called from the single writer thread). `trace_unsynchronized`'s own
+/// safety doc already warns it must not be called concurrently from
+/// multiple threads "without external synchronisation" — this is that
+/// synchronisation, extended to also cover `resolve`, since both
+/// ultimately reach `dbghelp.dll`, which Windows documents as not safe for
+/// concurrent calls from multiple threads. A single-threaded producer never
+/// contends this lock in practice; a multi-threaded one (concurrent
+/// allocating threads, or an allocating thread racing the writer thread's
+/// own resolve loop) genuinely needs it.
+pub(crate) static DBGHELP_LOCK: Mutex<()> = Mutex::new(());
 
 /// A `#[global_allocator]` that intercepts every (de/re)allocation and ships
 /// raw `AllocEvent` records off-process via a named pipe, without blocking
@@ -167,6 +181,7 @@ pub fn warm_up_symbol_resolution() {
     // is forcing whatever one-time setup `backtrace::resolve` performs to
     // run now, on this thread, before any hook exists to race against it.
     let addr = warm_up_symbol_resolution as *const () as *mut std::ffi::c_void;
+    let _guard = DBGHELP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     backtrace::resolve(addr, |_sym| {});
 }
 

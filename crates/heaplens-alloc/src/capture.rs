@@ -39,6 +39,16 @@ pub fn timestamp_nanos() -> u64 {
 pub fn capture_stack() -> ([u64; 16], u8) {
     let mut stack = [0u64; 16];
     let mut count = 0usize;
+    // Serialize against every other caller of `backtrace`'s Windows backend
+    // (this function, called from every allocating thread, and
+    // `writer::run`'s `resolve` calls on the writer thread) — see
+    // `crate::DBGHELP_LOCK`'s doc comment for why this is required, not
+    // just defensive. `.lock()`'s `Err` (a poisoned mutex, meaning some
+    // other caller panicked while holding it) is treated as "proceed
+    // anyway" rather than propagating the panic: a stale/corrupt symbol
+    // table is a degraded stack capture, not a reason to crash the whole
+    // allocation this call is instrumenting.
+    let _guard = crate::DBGHELP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     // SAFETY: called single-threaded per-thread, guard is held.
     unsafe {
         backtrace::trace_unsynchronized(|frame| {

@@ -20,6 +20,25 @@ pub fn run() {
     // Invariant §12.4: writer thread permanently holds the recursion guard.
     crate::guard::force_enter_permanent();
 
+    // Force `backtrace::resolve`'s one-time lazy setup (on Windows,
+    // `dbghelp.dll` load + `SymInitialize`) to complete now, synchronously,
+    // before this thread's main loop makes its first real resolve() call
+    // below, for the same reason `heaplens-hook`'s injected path already
+    // calls this explicitly before enabling hooks — see
+    // `warm_up_symbol_resolution`'s doc comment.
+    //
+    // Note: local-symbol resolution (this crate's own module, and any
+    // consuming binary's own code) additionally requires that binary's
+    // `.pdb` file be present next to its `.exe` at runtime — `dbghelp`
+    // searches the executable's own directory. This was the actual cause of
+    // a symbol-collapse bug that looked like a resolution race (every
+    // address resolving to the same address or an unrelated symbol, system-
+    // DLL exports like `BaseThreadInitThunk` unaffected since those don't
+    // need a local `.pdb`): a packaged release build had shipped `.exe`
+    // files without their matching `.pdb`s. Any packaging step for a
+    // release build must ship both.
+    crate::warm_up_symbol_resolution();
+
     let mut symbol_cache: HashMap<u64, String> = HashMap::new();
 
     loop {
@@ -70,11 +89,18 @@ pub fn run() {
                             continue;
                         }
                         let mut name = format!("0x{addr:x}");
-                        backtrace::resolve(addr as *mut _, |sym| {
-                            if let Some(n) = sym.name() {
-                                name = n.to_string();
-                            }
-                        });
+                        {
+                            // See `crate::DBGHELP_LOCK`'s doc comment —
+                            // required to avoid racing capture_stack's own
+                            // trace_unsynchronized calls on allocating
+                            // threads, not just defensive.
+                            let _guard = crate::DBGHELP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+                            backtrace::resolve(addr as *mut _, |sym| {
+                                if let Some(n) = sym.name() {
+                                    name = n.to_string();
+                                }
+                            });
+                        }
                         let is_machinery = is_machinery_symbol(&name);
                         symbol_cache.insert(addr, name.clone());
                         new_syms.push((addr, name, is_machinery));
