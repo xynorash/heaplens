@@ -109,6 +109,10 @@ class _ConnectionStatsPanelState extends ConsumerState<_ConnectionStatsPanel> {
               _snapshotCount++;
             case GraphDiff _:
               _diffCount++;
+            case GraphStats _:
+              // Observability-only counters, not part of graph topology —
+              // nothing here to tally alongside snapshot/diff counts.
+              break;
           }
         });
       });
@@ -233,6 +237,11 @@ class _VerboseLogsPanelState extends ConsumerState<_VerboseLogsPanel> {
             case GraphDiff diff:
               _log(
                 'diff received: +${diff.add.length} add, ~${diff.update.length} update, -${diff.remove.length} remove',
+              );
+            case GraphStats stats:
+              _log(
+                'stats: events=${stats.eventsReceived} resolved=${stats.symbolsResolved} '
+                'hex_fallback=${stats.hexFallback} target=${stats.targetName ?? "-"}',
               );
           }
         },
