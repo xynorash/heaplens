@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use heaplens_daemon::{
@@ -8,13 +8,13 @@ use heaplens_daemon::{
     config::Config,
     graph::OwnershipGraph,
     ingest, injector,
-    msg::{is_current_target_exit, ConnectRequest, GraphMsg, StoreMsg, TargetCmd},
+    msg::{is_current_target_exit, ConnectRequest, GraphMsg, OrphanEventRecord, StoreMsg, TargetCmd},
     procs,
     resolver::Resolver,
     server,
     store,
 };
-use heaplens_protocol::{ControlResponse, GraphMessage};
+use heaplens_protocol::{ControlResponse, GraphMessage, NodeState};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -80,11 +80,27 @@ async fn main() -> anyhow::Result<()> {
     // 11. Attach-session state (Stage 7 §3.4: single target at a time).
     let mut attached_pid: Option<u32> = None;
 
+    // Observability-only state for the Flutter target-diagnostics banner
+    // (see heaplens_flutter/lib/providers/target_diagnostics_provider.dart).
+    // None of this is read by phi or anomaly::sweep.
+    let mut events_received: u64 = 0;
+    let mut target_pid: Option<u64> = None;
+    let mut target_name: Option<String> = None;
+    let mut last_stats_sent = std::time::Instant::now();
+    const STATS_INTERVAL: std::time::Duration = std::time::Duration::from_millis(1000);
+
     // Graph loop — single-threaded owner of all graph state.
     loop {
         tokio::select! {
             msg = rx.recv() => match msg {
                 Some(GraphMsg::Events(events)) => {
+                    // Observability-only: counts every raw event as it
+                    // arrives, before any diff-visibility filtering — so it
+                    // stays accurate even for nodes born and freed within
+                    // the same tick, which drain_diff never surfaces (see
+                    // its doc comment). Read only by the Stats broadcast
+                    // below, never by phi or anomaly::sweep.
+                    events_received += events.len() as u64;
                     for ev in &events {
                         match ev.kind {
                             0 => {
@@ -100,7 +116,7 @@ async fn main() -> anyhow::Result<()> {
                                     );
                                 }
                             }
-                            1 => graph.on_dealloc(ev.ptr),
+                            1 => graph.on_dealloc(ev.ptr, ev.ts_nanos),
                             2 => graph.on_realloc(ev.old_ptr, ev.ptr, ev.size, &resolver),
                             _ => {}
                         }
@@ -113,6 +129,13 @@ async fn main() -> anyhow::Result<()> {
                 }
                 Some(GraphMsg::TargetConnected { pid, name }) => {
                     info!("attach session confirmed: pid={pid} name={name}");
+                    // Also the sole feed for the target-diagnostics stats
+                    // banner's pid/name — master's separate Handshake
+                    // message carried the identical (pid, name) pair from
+                    // the same underlying frame (see msg.rs); folded in
+                    // here rather than sending it twice.
+                    target_pid = Some(pid);
+                    target_name = Some(name);
                 }
                 Some(GraphMsg::TargetDisconnected { pid }) => {
                     // A pipe disconnect for the *currently tracked* pid means
@@ -127,6 +150,8 @@ async fn main() -> anyhow::Result<()> {
                     // attached successfully and is still running.
                     if is_current_target_exit(attached_pid, pid) {
                         attached_pid = None;
+                        target_pid = None;
+                        target_name = None;
                         info!("target pid={pid} exited or disconnected");
                         let _ = control_push_tx.send(Arc::new(ControlResponse::TargetExited { pid: pid as u32 }));
                     }
@@ -135,10 +160,40 @@ async fn main() -> anyhow::Result<()> {
                     warned_sites.clear();
                     // Anomaly sweep — returns ids of nodes whose state changed.
                     let max_ts = graph.max_ts_seen;
+                    // Diagnostic only (opt-in via RUST_LOG=heaplens_daemon=debug,
+                    // silent at the default "info" level, no behavior change):
+                    // lets an external observer reconstruct real wall-clock tick
+                    // cadence during a run, to distinguish steady ~tick_ms sweep
+                    // timing from queue-backlog draining. Not part of detection.
+                    debug!(max_ts, "tick");
                     storm_tracker.evict_idle(max_ts, &config);
                     let changed = sweep(graph.nodes_mut(), max_ts, &config);
-                    for id in changed {
+
+                    // Observability-only: for nodes that just flipped to
+                    // Orphan, pair the owner-free ts (recorded on the node
+                    // by on_dealloc, at the moment it happened) with this
+                    // tick's ts as the detection ts. sweep() above has
+                    // already fully decided `changed` and each node's
+                    // `state` — this only reads that decision, it cannot
+                    // feed back into it.
+                    let mut orphan_events: Vec<OrphanEventRecord> = Vec::new();
+                    for &id in &changed {
                         graph.mark_updated(id);
+                        if let Some(node) = graph.nodes().get(&id) {
+                            if node.state == NodeState::Orphan {
+                                if let Some(owner_free_ts_ns) = node.owner_free_ts {
+                                    orphan_events.push(OrphanEventRecord {
+                                        node_id: id,
+                                        owner_free_ts_ns,
+                                        orphan_detected_ts_ns: max_ts,
+                                        tau_ms: config.tau_ms,
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    if !orphan_events.is_empty() {
+                        let _ = store_tx.send(StoreMsg::OrphanEvents(orphan_events));
                     }
 
                     let diff = graph.drain_diff(&resolver);
@@ -154,6 +209,27 @@ async fn main() -> anyhow::Result<()> {
                     // Broadcast non-empty diffs to WS clients.
                     if is_non_empty_diff(&diff) {
                         let _ = broadcast_tx.send(Arc::new(diff));
+                    }
+
+                    // Observability-only: broadcast session counters on a
+                    // fixed 1s cadence (decoupled from tick_ms so this is a
+                    // steady heartbeat, not a per-tick spam) — the Flutter
+                    // target-diagnostics banner needs this even when the
+                    // graph itself is producing no diffs at all, since
+                    // that's exactly the "no heap activity" case it must
+                    // detect. Never read by phi or anomaly::sweep.
+                    if last_stats_sent.elapsed() >= STATS_INTERVAL {
+                        last_stats_sent = std::time::Instant::now();
+                        let (symbols_resolved, hex_fallback) = graph.symbol_stats(&resolver);
+                        let stats = GraphMessage::Stats {
+                            ts: max_ts,
+                            events_received,
+                            symbols_resolved,
+                            hex_fallback,
+                            target_pid,
+                            target_name: target_name.clone(),
+                        };
+                        let _ = broadcast_tx.send(Arc::new(stats));
                     }
                 }
                 None => break,
@@ -261,6 +337,6 @@ fn is_non_empty_diff(msg: &GraphMessage) -> bool {
         GraphMessage::Diff { add, update, remove, .. } => {
             !add.is_empty() || !update.is_empty() || !remove.is_empty()
         }
-        GraphMessage::Snapshot { .. } => false,
+        GraphMessage::Snapshot { .. } | GraphMessage::Stats { .. } => false,
     }
 }

@@ -130,7 +130,7 @@ async fn cross_process_wire_end_to_end() {
                                     graph.on_alloc(ev, &resolver);
                                     alloc_count += 1;
                                 }
-                                1 => graph.on_dealloc(ev.ptr),
+                                1 => graph.on_dealloc(ev.ptr, ev.ts_nanos),
                                 2 => graph.on_realloc(ev.old_ptr, ev.ptr, ev.size, &resolver),
                                 _ => {}
                             }
@@ -154,6 +154,12 @@ async fn cross_process_wire_end_to_end() {
                             }
                         }
                     }
+                    // The real producer sends a HANDSHAKE frame on connect,
+                    // now forwarded by ingest.rs as GraphMsg::TargetConnected
+                    // instead of discarded — this must not be treated as
+                    // end-of-stream by the catch-all below (it isn't a
+                    // connection close). TargetDisconnected is the pipe-close
+                    // counterpart and is equally not end-of-stream here.
                     Some(GraphMsg::TargetConnected { .. }) | Some(GraphMsg::TargetDisconnected { .. }) => continue,
                     _ => break,
                 },

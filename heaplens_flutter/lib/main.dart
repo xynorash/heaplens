@@ -16,6 +16,7 @@ import 'widgets/graph_canvas.dart';
 import 'widgets/insights_panel.dart';
 import 'widgets/memory_map.dart';
 import 'widgets/right_rail.dart';
+import 'widgets/target_status_banner.dart';
 
 void main() {
   runApp(const ProviderScope(child: HeapLensApp()));
@@ -208,6 +209,10 @@ class _GraphOrchestratorState extends ConsumerState<_GraphOrchestrator> {
         for (final id in diff.remove) {
           layout.removeNode(id);
         }
+      case GraphStats _:
+        // Session counters, not node data — the physics layout has nothing
+        // to do with these.
+        return;
     }
   }
 
@@ -250,6 +255,7 @@ class HeapLensHome extends ConsumerWidget {
               crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 const ControlBar(),
+                const TargetStatusBanner(),
                 Expanded(
                   child: Row(
                     // Same fix as the ribbon: Row's default cross-axis

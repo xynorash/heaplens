@@ -20,6 +20,13 @@ pub struct Node {
     pub had_owner_once: bool,
     /// Current anomaly classification; updated by anomaly::sweep.
     pub state: NodeState,
+    /// `ts_nanos` of the dealloc event that freed this node's owner, if any —
+    /// set once in `on_dealloc` when the owner is freed and this node is
+    /// orphaned. Observability-only: never read by `infer_ownership` or
+    /// `anomaly::sweep`'s state predicates, so it cannot influence detection
+    /// timing or outcome. Exists so H1 (detection-latency measurement) has a
+    /// real owner-free timestamp to measure from instead of inferring one.
+    pub owner_free_ts: Option<u64>,
 }
 
 pub struct OwnershipGraph {
@@ -74,6 +81,7 @@ impl OwnershipGraph {
             edges_out: Vec::new(),
             had_owner_once: owner_id.is_some(),
             state: NodeState::Healthy,
+            owner_free_ts: None,
         };
 
         // Register as a child of the owner.
@@ -89,7 +97,7 @@ impl OwnershipGraph {
         self.added.push(id);
     }
 
-    pub fn on_dealloc(&mut self, ptr: u64) {
+    pub fn on_dealloc(&mut self, ptr: u64, ts_nanos: u64) {
         let id = match self.by_ptr.remove(&ptr) {
             Some(id) => id,
             None => return,
@@ -109,6 +117,9 @@ impl OwnershipGraph {
             if let Some(child) = self.nodes.get_mut(&cid) {
                 child.owner = None;
                 child.had_owner_once = true;
+                // Observability-only: records which dealloc caused this —
+                // does not feed into ownership or anomaly-state logic.
+                child.owner_free_ts = Some(ts_nanos);
             }
             self.updated.insert(cid);
         }
@@ -283,6 +294,36 @@ impl OwnershipGraph {
         &mut self.nodes
     }
 
+    pub fn nodes(&self) -> &std::collections::HashMap<u64, Node> {
+        &self.nodes
+    }
+
+    /// Observability-only: counts, across currently-live nodes, how many
+    /// resolve to a real symbol name vs. fall back to a hex address (or
+    /// have no locatable site at all). Reuses the exact same
+    /// `effective_site_index`/`name_for` computation `node_to_dto` already
+    /// does per node — this is a read-only aggregate over that, not a new
+    /// classification, so it cannot diverge from what the wire actually
+    /// sends. Exists so the Flutter target-diagnostics banner can tell
+    /// "unsymbolized target" apart from other zero-edge causes without
+    /// re-deriving the hex-prefix check per node itself.
+    pub fn symbol_stats(&self, resolver: &Resolver) -> (u64, u64) {
+        let mut resolved = 0u64;
+        let mut hex_fallback = 0u64;
+        for n in self.nodes.values().filter(|n| n.live) {
+            let is_hex = match Self::effective_site_index(&n.stack, n.stack_len, resolver) {
+                Some(i) => resolver.name_for(n.stack[i]).starts_with("0x"),
+                None => true,
+            };
+            if is_hex {
+                hex_fallback += 1;
+            } else {
+                resolved += 1;
+            }
+        }
+        (resolved, hex_fallback)
+    }
+
     fn node_to_dto(n: &Node, resolver: &Resolver) -> NodeDto {
         let symbol = Self::effective_site_index(&n.stack, n.stack_len, resolver)
             .map(|i| resolver.name_for(n.stack[i]))
@@ -297,6 +338,57 @@ impl OwnershipGraph {
             state: n.state.clone(),
             edges: n.edges_out.clone(),
         }
+    }
+}
+
+#[cfg(test)]
+mod symbol_stats_tests {
+    use super::*;
+
+    /// Three live nodes: one with a resolved effective site, one whose
+    /// effective site address the resolver never learned (hex fallback),
+    /// and one with no locatable site at all (every frame classified as
+    /// machinery — also hex fallback, per `symbol_stats`'s doc comment). A
+    /// fourth, dead node is excluded entirely — `symbol_stats` only counts
+    /// live nodes, matching what `node_to_dto`/the wire actually reports for
+    /// the currently-visible graph.
+    #[test]
+    fn counts_resolved_vs_hex_fallback_across_live_nodes_only() {
+        let mut r = Resolver::new();
+        r.insert(0xAAA1, "myapp::resolved_site".to_owned(), false);
+        // 0xBBB1 is deliberately never inserted — name_for falls back to hex.
+        r.insert(0xCCC1, "alloc::vec::Vec<T>::with_capacity".to_owned(), true); // machinery only
+
+        let mut g = OwnershipGraph::new();
+
+        let mut resolved_stack = [0u64; 16];
+        resolved_stack[0] = 0xAAA1;
+        g.on_alloc(&AllocEvent::new(EventKind::Alloc, 0x1000, 0, 8, 8, 100, resolved_stack, 1), &r);
+
+        let mut hex_stack = [0u64; 16];
+        hex_stack[0] = 0xBBB1;
+        g.on_alloc(&AllocEvent::new(EventKind::Alloc, 0x2000, 0, 8, 8, 200, hex_stack, 1), &r);
+
+        let mut machinery_only_stack = [0u64; 16];
+        machinery_only_stack[0] = 0xCCC1;
+        g.on_alloc(&AllocEvent::new(EventKind::Alloc, 0x3000, 0, 8, 8, 300, machinery_only_stack, 1), &r);
+
+        // A fourth, now-dead node — must not be counted at all.
+        let mut dead_stack = [0u64; 16];
+        dead_stack[0] = 0xAAA1;
+        g.on_alloc(&AllocEvent::new(EventKind::Alloc, 0x4000, 0, 8, 8, 400, dead_stack, 1), &r);
+        g.on_dealloc(0x4000, 500);
+
+        let (resolved, hex_fallback) = g.symbol_stats(&r);
+        assert_eq!(resolved, 1, "only the truly-resolved live node should count as resolved");
+        assert_eq!(hex_fallback, 2, "unresolved-address and no-locatable-site live nodes both count as hex fallback");
+    }
+
+    #[test]
+    fn empty_graph_reports_zero_for_both_counts() {
+        let g = OwnershipGraph::new();
+        let r = Resolver::new();
+        assert_eq!(g.symbol_stats(&r), (0, 0));
     }
 }
 

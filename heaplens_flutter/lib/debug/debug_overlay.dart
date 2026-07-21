@@ -45,6 +45,8 @@ class DebugOverlay extends ConsumerStatefulWidget {
 class _DebugOverlayState extends ConsumerState<DebugOverlay> {
   int _snapshotCount = 0;
   int _diffCount = 0;
+  int _statsCount = 0;
+  GraphStats? _lastStats;
   Timer? _pollTimer;
   Timer? _logTimer;
   String? _lastStatsLine;
@@ -84,6 +86,9 @@ class _DebugOverlayState extends ConsumerState<DebugOverlay> {
               _snapshotCount++;
             case GraphDiff _:
               _diffCount++;
+            case GraphStats stats:
+              _statsCount++;
+              _lastStats = stats;
           }
         });
       });
@@ -110,9 +115,17 @@ class _DebugOverlayState extends ConsumerState<DebugOverlay> {
         ? 'never'
         : '${DateTime.now().difference(lastPaintAt).inMilliseconds}ms ago';
 
-    _lastStatsLine = 'WS=${status.name} msgs(snap=$_snapshotCount,diff=$_diffCount) '
+    final stats = _lastStats;
+    final statsSummary = stats == null
+        ? 'none yet'
+        : 'events=${stats.eventsReceived} '
+            'symbols=${stats.symbolsResolved}/${stats.symbolsResolved + stats.hexFallback} '
+            'target=${stats.targetName ?? '?'}[${stats.targetPid ?? '?'}]';
+
+    _lastStatsLine = 'WS=${status.name} msgs(snap=$_snapshotCount,diff=$_diffCount,stats=$_statsCount) '
         'revision=$revision liveNodes=$liveNodeCount simNodes=$simNodeCount '
-        'bounds=$bounds${hasNaN ? ' NaN!' : ''} lastPaint=$sincePaint';
+        'bounds=$bounds${hasNaN ? ' NaN!' : ''} lastPaint=$sincePaint '
+        'targetDiag($statsSummary)';
 
     return Positioned(
       right: 8,
@@ -136,12 +149,13 @@ class _DebugOverlayState extends ConsumerState<DebugOverlay> {
               mainAxisSize: MainAxisSize.min,
               children: [
                 Text('WS: ${status.name}'),
-                Text('msgs: snapshot=$_snapshotCount diff=$_diffCount'),
+                Text('msgs: snapshot=$_snapshotCount diff=$_diffCount stats=$_statsCount'),
                 Text('revision: $revision'),
                 Text('live nodes: $liveNodeCount'),
                 Text('simNodes: $simNodeCount'),
                 Text('sim bounds: $bounds${hasNaN ? '  !! NaN !!' : ''}'),
                 Text('last paint: $sincePaint'),
+                Text('target diag: $statsSummary'),
               ],
             ),
           ),

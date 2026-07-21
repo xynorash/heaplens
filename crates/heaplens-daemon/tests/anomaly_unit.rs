@@ -42,6 +42,7 @@ fn make_node(
         edges_out: vec![0u64; edges_out_count],
         had_owner_once,
         state: NodeState::Healthy,
+        owner_free_ts: None,
     }
 }
 

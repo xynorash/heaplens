@@ -99,6 +99,44 @@ void main() {
     });
   });
 
+  group('GraphStats.fromJson', () {
+    test('parses all fields, including null target identity before handshake', () {
+      final json = <String, dynamic>{
+        'type': 'stats',
+        'ts': 12345,
+        'events_received': 7,
+        'symbols_resolved': 3,
+        'hex_fallback': 4,
+        'target_pid': null,
+        'target_name': null,
+      };
+      final message = GraphMessage.fromJson(json);
+      expect(message, isA<GraphStats>());
+      final stats = message as GraphStats;
+      expect(stats.ts, 12345);
+      expect(stats.eventsReceived, 7);
+      expect(stats.symbolsResolved, 3);
+      expect(stats.hexFallback, 4);
+      expect(stats.targetPid, isNull);
+      expect(stats.targetName, isNull);
+    });
+
+    test('parses target identity once present', () {
+      final json = <String, dynamic>{
+        'type': 'stats',
+        'ts': 1,
+        'events_received': 0,
+        'symbols_resolved': 0,
+        'hex_fallback': 0,
+        'target_pid': 4242,
+        'target_name': 'target.exe',
+      };
+      final stats = GraphMessage.fromJson(json) as GraphStats;
+      expect(stats.targetPid, 4242);
+      expect(stats.targetName, 'target.exe');
+    });
+  });
+
   group('NodeDto 64-bit precision', () {
     test('preserves full 64-bit integer precision for u64 fields', () {
       // Synthetic test: use values near 64-bit max and at 2^53+1 (smallest
