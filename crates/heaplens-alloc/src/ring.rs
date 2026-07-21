@@ -283,12 +283,44 @@ pub fn shutdown() {
     thread_ring::shutdown();
 }
 
-/// Drain all events from all registered rings.
+/// Drain up to `max` events total across all registered rings, calling `f`
+/// for each.
+///
+/// # Why capped, not unconditional (2026-07-22 fix)
+///
+/// This used to drain every ring down to empty, unconditionally, in one
+/// call — no matter how much was pending. The writer thread's own batching
+/// discipline ("flush every 64 events or 1ms, whichever first",
+/// `writer.rs`'s `BATCH_CAP`/`FLUSH_INTERVAL`) only gates *when* to flush
+/// the accumulated batch; it never bounded what a single `drain_all` call
+/// could stuff into that batch beforehand. Each ring holds up to `CAP - 1`
+/// (65,535) events; with N producer threads each with their own ring, a
+/// writer thread that falls behind for any reason (a slow pipe write under
+/// daemon backpressure, a burst of first-time symbol resolutions, an OS
+/// scheduling gap under heavy concurrent load) could return to a
+/// `drain_all` call that swept up to `N * 65,535` events in one shot,
+/// blowing past not just the intended 64-event batch size but the wire
+/// protocol's own `u16` event-count field (`heaplens_protocol::frame`'s
+/// `encode_events`) — confirmed as the actual cause of a writer-thread
+/// panic (`events count exceeds u16::MAX`) under sustained 12-thread
+/// concurrent injection load, which in turn broke clean detach (the
+/// panicked thread never reached `mark_writer_stopped()`).
+///
+/// Capping here makes an oversized batch structurally impossible from this
+/// call site, rather than merely handling it gracefully at a higher limit:
+/// callers with a batch-size budget (the writer thread) must pass their
+/// *remaining* capacity, not drain everything unconditionally. Stopping
+/// early — mid-ring, or between rings — is always safe and resumable: a
+/// `Ring`'s own head/tail cursors are exactly where a partial drain leaves
+/// them, so the next `drain_all` call continues correctly from there. A
+/// ring whose producer died is only actually swept from the registry once
+/// it drains down to empty — hitting the cap mid-cleanup just defers that
+/// removal to a later call, it never skips or corrupts it.
 ///
 /// # Panics (debug builds)
 /// Panics if the calling thread has not called `guard::force_enter_permanent()`.
 /// This function must only be called from the writer thread.
-pub fn drain_all(mut f: impl FnMut(AllocEvent)) {
+pub fn drain_all(max: usize, mut f: impl FnMut(AllocEvent)) {
     debug_assert!(
         crate::guard::is_set(),
         "drain_all must be called only from a thread where the recursion guard is permanently set (writer thread)"
@@ -297,16 +329,31 @@ pub fn drain_all(mut f: impl FnMut(AllocEvent)) {
         .lock()
         .unwrap_or_else(|p| p.into_inner());
     let mut i = 0;
+    let mut drained = 0usize;
     while i < reg.len() {
-        while let Some(ev) = reg[i].pop() {
-            f(ev);
+        while drained < max {
+            match reg[i].pop() {
+                Some(ev) => { f(ev); drained += 1; }
+                None => break,
+            }
         }
+        if drained >= max {
+            return; // cap reached — remaining rings/events wait for the next call
+        }
+        // Ring i is empty (we only get here when the pop-loop above broke on
+        // `None`, not on the cap) — same dead-producer check/cleanup as before.
         if !reg[i].producer_alive.load(Ordering::Acquire) {
             // The Acquire on producer_alive synchronizes with the thread's death Release,
             // which transitively happens-after the last push's tail Release.
             // A second drain here picks up any event the first pass missed on weak-memory hardware.
-            while let Some(ev) = reg[i].pop() {
-                f(ev);
+            while drained < max {
+                match reg[i].pop() {
+                    Some(ev) => { f(ev); drained += 1; }
+                    None => break,
+                }
+            }
+            if drained >= max {
+                return;
             }
             reg.swap_remove(i);
         } else {
@@ -323,6 +370,18 @@ mod tests {
     fn ev(n: u64) -> AllocEvent {
         AllocEvent::new(EventKind::Alloc, n, 0, 64, 8, n, [0u64; 16], 0)
     }
+
+    /// `registry()` is a single process-global `Mutex<Vec<Arc<Ring>>>`, and
+    /// cargo runs tests in this binary concurrently by default. Any test
+    /// that pushes a ring into it and then calls `drain_all` is reading and
+    /// draining state shared with every other such test running at the same
+    /// time — one test's `drain_all` call can silently drain another's
+    /// still-pending ring, or leave stray rings behind for a later test to
+    /// see. Hold this lock for the duration of any test that touches the
+    /// registry (directly or via `crate::ring::push`) to serialize them
+    /// against each other; tests that only exercise a standalone `Ring`
+    /// instance never touch `registry()` and don't need it.
+    static REGISTRY_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn push_pop_roundtrip() {
@@ -363,6 +422,7 @@ mod tests {
 
     #[test]
     fn registry_drain_after_thread_exit() {
+        let _lock = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // A spawned thread pushes an event; after the thread exits, drain_all
         // must still return that event (the ring stays alive via Arc in registry).
         let handle = std::thread::spawn(|| {
@@ -379,9 +439,73 @@ mod tests {
         crate::guard::force_enter_permanent();
 
         let mut found = false;
-        drain_all(|e| {
+        drain_all(usize::MAX, |e| {
             if e.ptr == 0xDEAD { found = true; }
         });
         assert!(found, "event from exited thread must be drainable");
+    }
+
+    #[test]
+    fn drain_all_stops_at_the_cap_leaving_the_rest_for_next_call() {
+        let _lock = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ring = Ring::new();
+        for i in 0..10u64 {
+            assert!(ring.push(ev(i)));
+        }
+        registry().lock().unwrap_or_else(|p| p.into_inner()).push(std::sync::Arc::new(ring));
+
+        crate::guard::force_enter_permanent();
+
+        let mut first_pass: Vec<u64> = Vec::new();
+        drain_all(4, |e| first_pass.push(e.ptr));
+        assert_eq!(first_pass, vec![0, 1, 2, 3], "must stop exactly at the cap, in FIFO order");
+
+        let mut second_pass: Vec<u64> = Vec::new();
+        drain_all(100, |e| second_pass.push(e.ptr));
+        assert_eq!(
+            second_pass, vec![4, 5, 6, 7, 8, 9],
+            "the remaining events must still be there on the next call — capping must not drop anything"
+        );
+    }
+
+    #[test]
+    fn drain_all_cap_can_stop_mid_ring_across_multiple_producers() {
+        let _lock = REGISTRY_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // Two separate rings (standing in for two producer threads), each
+        // holding more than half the cap — proves the cap is enforced
+        // across the *total* drained this call, not reset per-ring, and
+        // that a cap hit partway through ring A correctly leaves ring B
+        // completely untouched for the next call.
+        let ring_a = Ring::new();
+        let ring_b = Ring::new();
+        for i in 0..6u64 {
+            assert!(ring_a.push(ev(100 + i)));
+        }
+        for i in 0..6u64 {
+            assert!(ring_b.push(ev(200 + i)));
+        }
+        {
+            let mut reg = registry().lock().unwrap_or_else(|p| p.into_inner());
+            reg.push(std::sync::Arc::new(ring_a));
+            reg.push(std::sync::Arc::new(ring_b));
+        }
+
+        crate::guard::force_enter_permanent();
+
+        let mut drained: Vec<u64> = Vec::new();
+        drain_all(8, |e| drained.push(e.ptr));
+        assert_eq!(drained.len(), 8, "must drain exactly the cap, not more");
+        assert_eq!(
+            &drained[0..6], &[100, 101, 102, 103, 104, 105],
+            "ring A must be fully drained first"
+        );
+        assert_eq!(
+            &drained[6..8], &[200, 201],
+            "ring B must be drained only up to the remaining cap budget"
+        );
+
+        let mut rest: Vec<u64> = Vec::new();
+        drain_all(100, |e| rest.push(e.ptr));
+        assert_eq!(rest, vec![202, 203, 204, 205], "ring B's remainder must survive to the next call");
     }
 }

@@ -33,6 +33,6 @@ fn concurrent_allocs_no_deadlock() {
 
     // Drain all recorded events and assert that at least one was captured.
     let mut count = 0usize;
-    heaplens_alloc::ring::drain_all(|_ev| { count += 1; });
+    heaplens_alloc::ring::drain_all(usize::MAX, |_ev| { count += 1; });
     assert!(count > 0, "expected at least one recorded event, got 0");
 }

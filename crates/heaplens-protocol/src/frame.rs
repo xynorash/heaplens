@@ -29,27 +29,52 @@ pub fn encode_handshake(pid: u64, name: &str) -> Vec<u8> {
 /// Encode an EVENTS frame.
 /// Wire: [u32 length][0x01][u16 count][AllocEvent × count]
 /// length = 1 + 2 + count * AllocEvent::SIZE
-pub fn encode_events(events: &[AllocEvent]) -> Vec<u8> {
+///
+/// Returns `None` if `events.len()` exceeds `u16::MAX` (65,535) — the
+/// count field's genuine wire-format width, shared with the decoder
+/// (`FrameDecoder::decode_events` also reads it as a `u16`), not just an
+/// internal type choice. Defense in depth, not the real fix: the actual
+/// producer-side defect this guards against — a writer-thread panic here,
+/// confirmed 2026-07-22 under sustained 12-thread injection load — was
+/// root-caused to `ring::drain_all` having no cap on how many events a
+/// single call could pull into a batch, structurally fixed there (see its
+/// doc comment) so a batch reaching anywhere near this limit should now be
+/// impossible in practice. This `Option` return exists so that if it ever
+/// happens anyway — a future caller with different batching assumptions,
+/// a bug reintroduced elsewhere — the writer thread can degrade (log and
+/// drop that batch) instead of panicking and taking clean detach down
+/// with it (a panicked writer thread never reaches `mark_writer_stopped`,
+/// which is exactly what broke `request_writer_stop_and_wait` here).
+pub fn encode_events(events: &[AllocEvent]) -> Option<Vec<u8>> {
+    let count = u16::try_from(events.len()).ok()?;
     let payload_len = 1 + 2 + events.len() * AllocEvent::SIZE;
     let mut buf = Vec::with_capacity(4 + payload_len);
     buf.extend_from_slice(&u32::try_from(payload_len).expect("events payload exceeds u32::MAX").to_le_bytes());
     buf.push(0x01);
-    buf.extend_from_slice(&u16::try_from(events.len()).expect("events count exceeds u16::MAX").to_le_bytes());
+    buf.extend_from_slice(&count.to_le_bytes());
     for ev in events {
         buf.extend_from_slice(ev.as_bytes());
     }
-    buf
+    Some(buf)
 }
 
 /// Encode a SYMBOLS frame.
 /// Wire: [u32 length][0x02][u16 count]([u64 addr][u16 name_len][name UTF-8][u8 is_machinery] × count)
-pub fn encode_symbols(symbols: &[(u64, &str, bool)]) -> Vec<u8> {
+///
+/// Returns `None` if `symbols.len()` exceeds `u16::MAX` — same defense-in-
+/// depth rationale as `encode_events`; see its doc comment. In practice
+/// this list is bounded by distinct newly-seen addresses per batch (at
+/// most `BATCH_CAP` events' worth of stack frames), far under the limit,
+/// but the count field is the same wire-format width for the same shared-
+/// with-the-decoder reason.
+pub fn encode_symbols(symbols: &[(u64, &str, bool)]) -> Option<Vec<u8>> {
+    let count = u16::try_from(symbols.len()).ok()?;
     let payload_body: usize = symbols.iter().map(|(_, n, _)| 8 + 2 + n.len() + 1).sum();
     let payload_len = 1 + 2 + payload_body;
     let mut buf = Vec::with_capacity(4 + payload_len);
     buf.extend_from_slice(&u32::try_from(payload_len).expect("symbols payload exceeds u32::MAX").to_le_bytes());
     buf.push(0x02);
-    buf.extend_from_slice(&u16::try_from(symbols.len()).expect("symbols count exceeds u16::MAX").to_le_bytes());
+    buf.extend_from_slice(&count.to_le_bytes());
     for (addr, name, is_machinery) in symbols {
         let name_bytes = name.as_bytes();
         buf.extend_from_slice(&addr.to_le_bytes());
@@ -57,7 +82,7 @@ pub fn encode_symbols(symbols: &[(u64, &str, bool)]) -> Vec<u8> {
         buf.extend_from_slice(name_bytes);
         buf.push(u8::from(*is_machinery));
     }
-    buf
+    Some(buf)
 }
 
 const MAX_FRAME_LEN: u32 = 8 * 1024 * 1024; // 8 MiB

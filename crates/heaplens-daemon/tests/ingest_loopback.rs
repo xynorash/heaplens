@@ -13,7 +13,7 @@ fn make_alloc_event(ptr: u64, size: u64, ts: u64, stack: &[u64]) -> AllocEvent {
 
 /// Encode events through FrameDecoder round-trip → GraphMsg::Events
 fn events_to_msg(events: &[AllocEvent]) -> GraphMsg {
-    let bytes = encode_events(events);
+    let bytes = encode_events(events).expect("well under u16::MAX");
     let mut decoder = FrameDecoder::new();
     decoder.push(&bytes);
     match decoder.next().expect("decoder must yield a frame") {

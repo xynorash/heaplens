@@ -74,8 +74,14 @@ pub fn run() {
         let mut last_flush = Instant::now();
 
         'send: loop {
-            // Drain all rings into batch.
-            crate::ring::drain_all(|ev| batch.push(ev));
+            // Drain all rings into batch — capped at the *remaining* room in
+            // this batch, never unconditionally. An uncapped drain here is
+            // exactly what let a producer backlog under sustained load blow
+            // past both the intended BATCH_CAP and the wire protocol's own
+            // u16 event-count field, panicking the writer thread — see
+            // `ring::drain_all`'s doc comment for the full mechanism.
+            let remaining = BATCH_CAP.saturating_sub(batch.len());
+            crate::ring::drain_all(remaining, |ev| batch.push(ev));
 
             let should_flush =
                 batch.len() >= BATCH_CAP || last_flush.elapsed() >= FLUSH_INTERVAL;
@@ -113,20 +119,56 @@ pub fn run() {
                         .iter()
                         .map(|(a, n, m)| (*a, n.as_str(), *m))
                         .collect();
-                    if pipe.write_all(&encode_symbols(&refs)).is_err() {
-                        new_syms.clear();
-                        batch.clear();
-                        break 'send; // reconnect
+                    match encode_symbols(&refs) {
+                        Some(frame) => {
+                            if pipe.write_all(&frame).is_err() {
+                                new_syms.clear();
+                                batch.clear();
+                                break 'send; // reconnect
+                            }
+                        }
+                        None => {
+                            // Defense in depth — should be structurally
+                            // unreachable now that drain_all caps what a
+                            // batch (and therefore new_syms, bounded by it)
+                            // can ever accumulate; see its doc comment. Drop
+                            // rather than panic: a lost SYMBOLS frame just
+                            // means those addresses get re-resolved and
+                            // re-sent on a later batch (symbol_cache is
+                            // additive, never assumes a name arrives exactly
+                            // once) — far preferable to killing this thread,
+                            // which is exactly what broke clean detach here.
+                            eprintln!(
+                                "heaplens-alloc writer: dropping oversized SYMBOLS batch ({} entries, exceeds u16::MAX)",
+                                refs.len()
+                            );
+                        }
                     }
                     new_syms.clear();
                 }
 
                 // Emit EVENTS frame.
-                if pipe.write_all(&encode_events(&batch)).is_err()
-                    || pipe.flush().is_err()
-                {
-                    batch.clear();
-                    break 'send; // reconnect
+                match encode_events(&batch) {
+                    Some(frame) => {
+                        if pipe.write_all(&frame).is_err() || pipe.flush().is_err() {
+                            batch.clear();
+                            break 'send; // reconnect
+                        }
+                    }
+                    None => {
+                        // Same defense-in-depth rationale as the SYMBOLS
+                        // case above — this is the exact condition that
+                        // used to panic this thread under sustained
+                        // 12-thread injection load (confirmed 2026-07-22).
+                        // Dropping one batch's worth of capture data is a
+                        // bounded, silent data-quality issue; a panicked
+                        // writer thread never reaches mark_writer_stopped,
+                        // which is what actually broke clean detach.
+                        eprintln!(
+                            "heaplens-alloc writer: dropping oversized EVENTS batch ({} events, exceeds u16::MAX)",
+                            batch.len()
+                        );
+                    }
                 }
 
                 batch.clear();

@@ -9,7 +9,7 @@ fn resync_after_absurd_length_prefix() {
         EventKind::Dealloc, 0x5555_0000_0001, 0, 64, 8, 1, [0u64; 16], 0,
     );
     let valid1 = encode_handshake(1, "before-junk");
-    let valid2 = encode_events(&[event]);
+    let valid2 = encode_events(&[event]).expect("well under u16::MAX");
 
     // Junk: a u32 length prefix of 0xFF_FF_FF_FF (> MAX_FRAME_LEN = 8 MiB),
     // followed by a few bytes. The decoder must drain one byte at a time until

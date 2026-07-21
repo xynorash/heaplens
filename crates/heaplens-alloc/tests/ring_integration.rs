@@ -19,7 +19,7 @@ fn thread_ring_drainable_after_exit() {
     heaplens_alloc::guard::force_enter_permanent();
 
     let mut found = false;
-    ring::drain_all(|e| {
+    ring::drain_all(usize::MAX, |e| {
         if e.ptr == 0xBEEF_CAFE {
             found = true;
         }

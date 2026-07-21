@@ -21,9 +21,27 @@ const MIN_ALLOC_NODES: usize = 100;
 #[derive(Default, Debug)]
 struct Summary {
     alloc_count: usize,
-    /// Final known edge list per node id, updated on every add/update seen
-    /// over the whole run — the last write for a given id is authoritative,
-    /// since `edges_out` only grows/shrinks in place, never resets.
+    /// Peak (largest-ever-seen) edge list per node id, across every add/update
+    /// observed over the whole run.
+    ///
+    /// Deliberately NOT last-write-wins. `wire_producer` frees every node it
+    /// allocates before exiting, so `edges_out` legitimately shrinks back
+    /// toward empty as dealloc events arrive — a node's *final* diffed state
+    /// is its torn-down state, not its topology while alive. The daemon
+    /// batches dealloc events (BATCH_CAP-sized batches, drained and diffed
+    /// independently), so root's own removal does not generally land in the
+    /// same diff as most of its children's removals; root is filtered out of
+    /// `update` only in the one diff where root itself is also in `removed`,
+    /// so intermediate diffs showing root's edge list mid-shrink are fully
+    /// visible to this harness. Tracking the max-length edge list per id
+    /// captures the real peak topology (what the test is actually asserting)
+    /// regardless of how dealloc events happen to be split across batches —
+    /// last-write-wins made this assertion depend on an incidental batching
+    /// artifact (confirmed 2026-07-22: capping `drain_all`'s batch size,
+    /// a correctness fix with no effect on event delivery, changed dealloc
+    /// batch boundaries enough to flip this test from pass to fail even
+    /// though φ inference recorded the correct owner for every single
+    /// allocation, verified via direct trace).
     final_edges: std::collections::HashMap<u64, Vec<u64>>,
     /// Distinct resolved names classified non-machinery over the whole run —
     /// a collapse canary. If classification silently regresses to "nothing
@@ -150,7 +168,12 @@ async fn cross_process_wire_end_to_end() {
                         }
                         if let heaplens_protocol::GraphMessage::Diff { add, update, .. } = diff {
                             for n in add.iter().chain(update.iter()) {
-                                final_edges.insert(n.id, n.edges.clone());
+                                // Keep the largest-ever-seen edge list, not the
+                                // latest — see `Summary::final_edges`'s doc comment.
+                                let entry = final_edges.entry(n.id).or_default();
+                                if n.edges.len() > entry.len() {
+                                    *entry = n.edges.clone();
+                                }
                             }
                         }
                     }

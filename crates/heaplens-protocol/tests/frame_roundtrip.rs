@@ -32,7 +32,7 @@ fn sample_event(n: u64) -> AllocEvent {
 #[test]
 fn events_round_trip_multiple() {
     let events = vec![sample_event(1), sample_event(2), sample_event(3)];
-    let encoded = encode_events(&events);
+    let encoded = encode_events(&events).expect("well under u16::MAX");
     let mut dec = make_decoder_with(&encoded);
     match dec.next().expect("expected a frame") {
         Frame::Events(decoded) => {
@@ -46,6 +46,39 @@ fn events_round_trip_multiple() {
     assert!(dec.next().is_none());
 }
 
+/// Regression for the writer-thread panic found under sustained 12-thread
+/// injection load (2026-07-22): `encode_events`/`encode_symbols` used to
+/// `.expect()` the `u16` count conversion, panicking the writer thread on an
+/// oversized batch and breaking clean detach (a panicked writer never calls
+/// `mark_writer_stopped`). The real fix is capping `ring::drain_all` so a
+/// batch can never structurally reach this size — this test covers the
+/// defense-in-depth boundary itself: given a batch that does exceed
+/// `u16::MAX` (however that came to be), encoding must fail gracefully
+/// (`None`), never panic.
+#[test]
+fn encode_events_returns_none_instead_of_panicking_when_over_u16_max() {
+    let event = sample_event(1);
+    let oversized: Vec<AllocEvent> = std::iter::repeat(event)
+        .take(u16::MAX as usize + 1)
+        .collect();
+    assert_eq!(encode_events(&oversized), None, "must fail gracefully, not panic");
+
+    // One under the limit still encodes fine — confirms the boundary is
+    // exactly u16::MAX, not off-by-one in either direction.
+    let at_limit: Vec<AllocEvent> = std::iter::repeat(event)
+        .take(u16::MAX as usize)
+        .collect();
+    assert!(encode_events(&at_limit).is_some(), "exactly u16::MAX must still encode");
+}
+
+#[test]
+fn encode_symbols_returns_none_instead_of_panicking_when_over_u16_max() {
+    let oversized: Vec<(u64, &str, bool)> = std::iter::repeat((0x1234u64, "sym", false))
+        .take(u16::MAX as usize + 1)
+        .collect();
+    assert_eq!(encode_symbols(&oversized), None, "must fail gracefully, not panic");
+}
+
 #[test]
 fn symbols_round_trip_multiple() {
     let syms: Vec<(u64, &str, bool)> = vec![
@@ -53,7 +86,7 @@ fn symbols_round_trip_multiple() {
         (0x7fff_dead_0002, "std::collections::HashMap::insert", false),
         (0x7fff_dead_0003, "my_crate::foo::bar", false),
     ];
-    let encoded = encode_symbols(&syms);
+    let encoded = encode_symbols(&syms).expect("well under u16::MAX");
     let mut dec = make_decoder_with(&encoded);
     match dec.next().expect("expected a frame") {
         Frame::Symbols(decoded) => {

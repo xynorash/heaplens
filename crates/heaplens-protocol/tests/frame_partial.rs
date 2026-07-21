@@ -14,7 +14,7 @@ fn single_frame_fed_one_byte_at_a_time() {
         stack,
         1,
     );
-    let encoded = encode_events(&[event]);
+    let encoded = encode_events(&[event]).expect("well under u16::MAX");
 
     let mut dec = FrameDecoder::new();
     let mut frames_seen = 0usize;

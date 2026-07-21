@@ -7,8 +7,8 @@ fn three_frames_in_one_push() {
         EventKind::Alloc, 0x1000_0000_0001, 0, 128, 8, 42_000_000, [0u64; 16], 0,
     );
     let f1 = encode_handshake(99, "multi-test");
-    let f2 = encode_events(&[event]);
-    let f3 = encode_symbols(&[(0x7fff_1234_5678, "some::symbol", false)]);
+    let f2 = encode_events(&[event]).expect("well under u16::MAX");
+    let f3 = encode_symbols(&[(0x7fff_1234_5678, "some::symbol", false)]).expect("well under u16::MAX");
 
     let mut combined = Vec::new();
     combined.extend_from_slice(&f1);
