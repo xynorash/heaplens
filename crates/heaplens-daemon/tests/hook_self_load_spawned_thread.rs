@@ -231,7 +231,7 @@ async fn hook_self_load_spawned_thread_end_to_end() {
                 }
             }
             1 => {
-                graph.on_dealloc(ev.ptr);
+                graph.on_dealloc(ev.ptr, ev.ts_nanos);
                 if expected_frees.contains(&ev.ptr) {
                     s.matched_frees.insert(ev.ptr);
                 }
