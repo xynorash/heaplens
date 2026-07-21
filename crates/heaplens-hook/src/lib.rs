@@ -26,6 +26,10 @@ use windows_sys::Win32::System::Threading::{GetCurrentThread, GetCurrentThreadId
 
 use heaplens_protocol::EventKind;
 
+// TEMPORARY (hook owner-free crash diagnosis) — see diag_veh.rs's module
+// doc comment for scope and removal instructions.
+mod diag_veh;
+
 // ── Private heap allocator (§4.2: internal bookkeeping never lands on the ─
 //    target's own default heap, isolating our footprint from what the
 //    target — or its own diagnostics — would see as its heap contents).
@@ -347,6 +351,12 @@ pub unsafe extern "system" fn HeapLensHookAttachRemote() -> u32 {
 }
 
 fn attach_impl() -> u32 {
+    // TEMPORARY (hook owner-free crash diagnosis): installed first, before
+    // anything else in this function, so it can catch a fault anywhere in
+    // the attach sequence itself, not just steady-state capture. See
+    // diag_veh.rs.
+    diag_veh::install();
+
     if ATTACHED.swap(true, Ordering::AcqRel) {
         return 0; // already attached — idempotent
     }

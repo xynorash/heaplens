@@ -281,6 +281,7 @@ dependencies = [
 name = "heaplens-hook"
 version = "0.1.0"
 dependencies = [
+ "backtrace",
  "heaplens-alloc",
  "heaplens-protocol",
  "minhook",

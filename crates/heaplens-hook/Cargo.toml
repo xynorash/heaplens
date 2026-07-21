@@ -11,10 +11,16 @@ crate-type = ["cdylib"]
 heaplens-protocol = { path = "../heaplens-protocol" }
 heaplens-alloc = { path = "../heaplens-alloc" }
 minhook = "0.9"
+# TEMPORARY (hook owner-free crash diagnosis): backtrace for the diagnostic
+# VEH in diag_veh.rs. Strip this dependency along with that module once the
+# investigation closes.
+backtrace = "0.3"
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_System_Memory",
     "Win32_System_LibraryLoader",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
 ] }
