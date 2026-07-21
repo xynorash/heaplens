@@ -398,6 +398,21 @@ class _ConnectionIndicator extends StatelessWidget {
   }
 }
 
+/// Cross-process attachment is disabled in this build following a
+/// confirmed, reproducible hook defect (crash under concurrent
+/// multi-threaded allocation load, corroborated by a real-world crash
+/// recorded inside heaplens_hook.dll and a kernel bugcheck) — see
+/// README.txt. This gate gets flipped back once the defect is fixed;
+/// until then the "Attach" entry point must stay visibly present but
+/// disabled, not silently removed, so a user sees *why* rather than
+/// wondering if the button vanished by accident.
+const bool kAttachEnabled = false;
+const String kAttachDisabledReason =
+    'Process attachment is temporarily disabled in this build — a confirmed '
+    'hook defect was found during testing (crash under concurrent '
+    'multi-threaded allocation). See README.txt. The cooperative capture '
+    'path used by the bundled example producers is unaffected.';
+
 /// "Attach to Process…" button when nothing is attached, or a compact
 /// "attached" indicator plus a Detach button when one is. The full
 /// name/pid readout lives in the Target identity cell (Cell 4) — this
@@ -413,11 +428,17 @@ class _AttachControl extends StatelessWidget {
   Widget build(BuildContext context) {
     final attached = this.attached;
     if (attached == null) {
-      return ElevatedButton.icon(
+      final button = ElevatedButton.icon(
         key: const Key('attachButton'),
         icon: const Icon(Icons.link, size: 16),
         label: const Text('Attach'),
-        onPressed: () => showProcessPickerDialog(context),
+        onPressed: kAttachEnabled ? () => showProcessPickerDialog(context) : null,
+      );
+      if (kAttachEnabled) return button;
+      return Tooltip(
+        key: const Key('attachDisabledTooltip'),
+        message: kAttachDisabledReason,
+        child: button,
       );
     }
     return Row(
