@@ -217,6 +217,52 @@ void main() {
       expect(find.byKey(const Key('detachButton')), findsNothing);
     });
 
+    // Coverage gap flagged after the injection-safety-gate merge (2026-07-21):
+    // the tests above only ever checked presence/absence of the button by
+    // key, never whether it was actually *disabled*, nor what the
+    // safety-explanation tooltip actually says. A future edit could silently
+    // re-enable the button, or water down/drop the explanation, without
+    // failing anything — this closes that gap.
+    testWidgets(
+        'Attach button is genuinely disabled (onPressed is null, not just '
+        'styled) and carries the exact safety-explanation tooltip while '
+        'kAttachEnabled is false', (tester) async {
+      final controller = StreamController<GraphMessage>();
+      addTearDown(() => controller.close());
+      await _pumpControlBar(tester, controller);
+
+      // Pin the real, current gate state this test's assertions depend on —
+      // if this ever flips, the assertions below intentionally stop
+      // matching production behavior, which is exactly the point.
+      expect(kAttachEnabled, isFalse,
+          reason: 'this test asserts the *disabled* branch; it must be '
+              'updated (or a companion enabled-state test added) if this '
+              'flag ever flips back to true — see the last report\'s note '
+              'on kAttachEnabled not being injectable for a true inverse '
+              'widget test without a small ControlBar refactor');
+
+      final button = tester.widget<ElevatedButton>(
+        find.byKey(const Key('attachButton')),
+      );
+      expect(
+        button.onPressed,
+        isNull,
+        reason: 'must be genuinely disabled (onPressed == null), not just '
+            'visually styled to look disabled',
+      );
+
+      final tooltip = tester.widget<Tooltip>(
+        find.byKey(const Key('attachDisabledTooltip')),
+      );
+      expect(
+        tooltip.message,
+        kAttachDisabledReason,
+        reason: 'the safety-explanation tooltip text must match exactly — '
+            'a future edit that waters down or removes the explanation '
+            'must fail here, not pass silently',
+      );
+    });
+
     testWidgets('shows the attached target\'s name/pid and a Detach button once attached',
         (tester) async {
       final controller = StreamController<GraphMessage>();
