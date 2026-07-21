@@ -151,6 +151,18 @@ pub fn request_writer_stop_and_wait(timeout: std::time::Duration) -> bool {
     true
 }
 
+/// Proactively tears down the per-thread ring-registration mechanism
+/// itself, ahead of any chance this module gets unloaded. **Required by
+/// `heaplens-hook`'s `HeapLensHookDetach`/`HeapLensHookDetachApc`** — see
+/// `ring::shutdown`'s doc comment for the full account of the crash this
+/// closes (a stale per-thread ring registration whose exit callback lives
+/// inside this DLL, invoked after the DLL may have already been unloaded).
+/// Safe to call regardless of hook state; does not touch MinHook or the
+/// private heap.
+pub fn shutdown_ring_storage() {
+    ring::shutdown();
+}
+
 /// Forces `backtrace::resolve`'s one-time lazy initialization (on Windows,
 /// this loads and initializes `dbghelp.dll` — `SymInitialize` and friends)
 /// to happen now, synchronously, on the calling (normal) thread.

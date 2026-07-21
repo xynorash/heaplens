@@ -96,43 +96,191 @@ fn registry() -> &'static Mutex<Vec<Arc<Ring>>> {
     REGISTRY.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-/// RAII handle held in TLS. On thread exit (Drop), marks the ring
-/// producer-dead so the writer knows it can remove the ring after draining.
-struct RingHandle(Arc<Ring>);
+/// Per-thread ring storage, keyed by Fiber Local Storage rather than a
+/// plain `thread_local!`.
+///
+/// # Why not `thread_local!`
+///
+/// This used to be exactly that — `thread_local! { static THREAD_RING:
+/// RingHandle = ...; }`, with `RingHandle`'s `Drop` impl doing the
+/// producer-death signalling described above. That crashed reliably
+/// (confirmed via the `self_load_concurrency_stress` regression harness,
+/// 2026-07-21 root-cause investigation) on any thread other than the one
+/// that called `LoadLibraryW` to load this DLL. Root cause: `heaplens-hook`
+/// is always loaded via `LoadLibraryW` at runtime (self-load or real
+/// injection, never linked into the process at startup), and a
+/// dynamically-loaded module's thread-locals are only reliably wired up
+/// for the thread that loaded it — this held even for `RingHandle` despite
+/// it having a real `Drop` impl (an earlier fix attempt assumed giving a
+/// thread-local's value type a `Drop` impl changes which underlying
+/// mechanism rustc/std uses to something safe for this scenario; that
+/// assumption was wrong — see `guard.rs`'s doc comment for the full
+/// account of that dead end). Full mechanism root-caused via reduction:
+/// see the investigation report; not repeated here.
+///
+/// The fix: bypass `thread_local!` for the ring pointer itself and drive
+/// Fiber Local Storage directly (`FlsAlloc`/`FlsGetValue`/`FlsSetValue`) —
+/// like `guard.rs`'s `TlsAlloc`-based fix, a slot-index mechanism with no
+/// dependency on module linkage or which thread loaded what, confirmed
+/// safe from any thread regardless of `LoadLibraryW` timing. Unlike plain
+/// `TlsAlloc`, FLS supports a real per-thread exit callback
+/// (`FlsAlloc`'s `lpCallback`), which is what preserves this module's
+/// existing invariant — a producer thread's ring gets marked dead (and
+/// eventually reclaimed by the writer) when that thread exits, without
+/// requiring the thread's own cooperation (essential: real injected
+/// targets' threads cannot be asked to call an explicit cleanup function
+/// before they exit).
+#[cfg(windows)]
+mod thread_ring {
+    use std::ffi::c_void;
+    use std::sync::atomic::Ordering;
+    use std::sync::{Arc, OnceLock};
+    use windows_sys::Win32::System::Threading::{FlsAlloc, FlsFree, FlsGetValue, FlsSetValue};
 
-impl Drop for RingHandle {
-    fn drop(&mut self) {
-        // Signal writer: producer is gone; remaining events are still readable.
-        // Note: the Arc in REGISTRY keeps the Ring alive until drain_all removes it.
-        self.0.producer_alive.store(false, Ordering::Release);
+    use super::{registry, Ring};
+
+    static FLS_INDEX: OnceLock<u32> = OnceLock::new();
+
+    /// Called by the OS when a thread (or fiber) that ever set this FLS
+    /// slot exits. Reconstructs the `Arc<Ring>` this slot owned (the
+    /// strong reference taken out in `with_ring` below, distinct from the
+    /// registry's own clone), marks the ring's producer dead, then lets
+    /// the `Arc` drop — releasing only *this* reference; the registry's
+    /// clone keeps the `Ring` itself alive until `drain_all` removes it.
+    unsafe extern "system" fn on_thread_exit(data: *const c_void) {
+        if data.is_null() {
+            return;
+        }
+        let ring = unsafe { Arc::from_raw(data.cast::<Ring>()) };
+        ring.producer_alive.store(false, Ordering::Release);
     }
-}
 
-thread_local! {
-    // Initialised lazily on first push(). Init allocates via the global
-    // allocator (Arc::new, Vec::push), but the recursion guard is always
-    // set before push() is called from record(), so those allocations are
-    // suppressed by the guard and never re-enter record().
-    //
-    // Windows note: the Drop destructor runs on thread exit for threads
-    // created via std::thread. Main-thread TLS destructors may NOT run on
-    // Windows (no DllMain THREAD_DETACH for the main thread); the writer's
-    // periodic drain picks up main-thread events instead.
-    static THREAD_RING: RingHandle = {
+    fn index() -> u32 {
+        *FLS_INDEX.get_or_init(|| unsafe { FlsAlloc(Some(on_thread_exit)) })
+    }
+
+    /// Explicit, proactive cleanup — call before there's any chance this
+    /// module gets unloaded (i.e. from `detach_impl`, our own controlled
+    /// unload point), not left to happen implicitly at process exit.
+    ///
+    /// Confirmed necessary (root-cause investigation, 2026-07-21): without
+    /// this, a thread that made *any* hooked allocation and is still alive
+    /// when the whole process later exits — in practice, the thread that
+    /// called `attach`/`detach` itself, since even its own `println!`
+    /// calls while hooks are live route through this same registration —
+    /// keeps a live FLS registration pointing at `on_thread_exit`, code
+    /// living inside this DLL. If process teardown unloads/unmaps this DLL
+    /// before the OS gets around to running that thread's FLS callback,
+    /// the callback fires into freed/unmapped memory — reliably reproduced
+    /// as a crash strictly *after* a full clean attach/workload/detach
+    /// cycle, i.e. after this module's own job was already done.
+    ///
+    /// `FlsFree` deregisters the index outright, so no future thread exit —
+    /// including ones we have no way to wait for, e.g. an uncooperative
+    /// injected target's other threads that are still running when we
+    /// detach — can invoke this callback again after this call returns,
+    /// regardless of when the process or this DLL actually goes away.
+    /// Trade-off, accepted deliberately: any *other* thread that is still
+    /// alive with an unflushed ring at this exact moment loses its
+    /// automatic dead-producer detection for that ring (it stays
+    /// `producer_alive: true` in the registry forever) — a stale entry,
+    /// not a crash, and no worse than what already happens to any ring
+    /// whose thread hasn't exited by the time `detach` runs.
+    pub fn shutdown() {
+        let idx = index();
+        // Clear our own (the calling thread's) slot directly rather than
+        // relying on FlsFree to invoke the callback for it — documented
+        // behavior of exactly what FlsFree does for the calling thread's
+        // own value differs across doc revisions; doing it explicitly
+        // removes any ambiguity.
+        let ptr = unsafe { FlsGetValue(idx) };
+        if !ptr.is_null() {
+            unsafe { on_thread_exit(ptr) };
+            unsafe { FlsSetValue(idx, std::ptr::null()) };
+        }
+        unsafe { FlsFree(idx) };
+    }
+
+    /// Runs `f` against the current thread's ring, creating and
+    /// registering it on first call. Initialisation allocates (`Arc::new`,
+    /// `Vec::push` into the registry) via the global allocator, but the
+    /// recursion guard is always set before this runs (called only from
+    /// `record()`), so those allocations are suppressed and never
+    /// re-enter `record()`.
+    #[inline]
+    pub fn with_ring<R>(f: impl FnOnce(&Ring) -> R) -> R {
+        let idx = index();
+        let ptr = unsafe { FlsGetValue(idx) } as *const Ring;
+        if !ptr.is_null() {
+            // SAFETY: this slot's Arc reference (taken out below, or by a
+            // prior call on this same thread) stays alive until this
+            // thread exits and `on_thread_exit` runs — which cannot be
+            // happening concurrently with this call, since both only ever
+            // run on this thread.
+            return f(unsafe { &*ptr });
+        }
         let ring = Arc::new(Ring::new());
         registry()
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .push(Arc::clone(&ring));
-        RingHandle(ring)
-    };
+        let raw = Arc::into_raw(ring);
+        unsafe { FlsSetValue(idx, raw as *const c_void) };
+        // SAFETY: `raw` is the pointer this slot now owns; no other
+        // reference to it is dereferenced concurrently (see above).
+        f(unsafe { &*raw })
+    }
+}
+
+/// Non-Windows fallback — see `guard.rs`'s equivalent for why this project
+/// otherwise only targets Windows.
+#[cfg(not(windows))]
+mod thread_ring {
+    use std::sync::Arc;
+
+    use super::{registry, Ring};
+
+    struct RingHandle(Arc<Ring>);
+
+    impl Drop for RingHandle {
+        fn drop(&mut self) {
+            self.0.producer_alive.store(false, std::sync::atomic::Ordering::Release);
+        }
+    }
+
+    thread_local! {
+        static THREAD_RING: RingHandle = {
+            let ring = Arc::new(Ring::new());
+            registry()
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .push(Arc::clone(&ring));
+            RingHandle(ring)
+        };
+    }
+
+    pub fn with_ring<R>(f: impl FnOnce(&Ring) -> R) -> R {
+        THREAD_RING.with(|h| f(&h.0))
+    }
+
+    /// No-op here — plain `thread_local!` destructors don't have the
+    /// DLL-unload-ordering hazard the Windows path works around.
+    pub fn shutdown() {}
 }
 
 /// Push an event onto the current thread's ring. Lock-free; never allocates
-/// after TLS is initialised (first call per thread has one-time init cost).
+/// after first-call-per-thread initialisation.
 #[inline]
 pub fn push(ev: AllocEvent) -> bool {
-    THREAD_RING.with(|h| h.0.push(ev))
+    thread_ring::with_ring(|ring| ring.push(ev))
+}
+
+/// Proactively tears down the per-thread ring storage mechanism itself —
+/// see `thread_ring::shutdown`'s doc comment. Must be called from
+/// `heaplens-hook`'s `detach_impl` (its own controlled unload point),
+/// before there's any chance this module gets unloaded.
+pub fn shutdown() {
+    thread_ring::shutdown();
 }
 
 /// Drain all events from all registered rings.

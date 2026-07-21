@@ -6,3 +6,6 @@ edition = "2021"
 [dependencies]
 heaplens-protocol = { path = "../heaplens-protocol" }
 backtrace = "0.3"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Threading"] }

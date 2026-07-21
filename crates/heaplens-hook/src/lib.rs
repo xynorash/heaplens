@@ -524,8 +524,16 @@ fn detach_impl() -> u32 {
         return 6;
     }
 
-    // Writer confirmed stopped. Now safe to fully uninitialize MinHook
-    // (frees its trampolines) and destroy the private heap.
+    // Writer confirmed stopped — no other thread is concurrently pushing
+    // to or draining any ring now. Tear down the per-thread ring-storage
+    // mechanism itself before there's any chance this DLL gets unloaded;
+    // see `heaplens_alloc::shutdown_ring_storage`'s doc comment for the
+    // crash this closes (a stale FLS registration whose callback lives in
+    // this DLL, invoked after the DLL may already be unloaded).
+    heaplens_alloc::shutdown_ring_storage();
+
+    // Now safe to fully uninitialize MinHook (frees its trampolines) and
+    // destroy the private heap.
     MinHook::uninitialize();
 
     ORIG_HEAP_ALLOC.store(std::ptr::null_mut(), Ordering::Release);
