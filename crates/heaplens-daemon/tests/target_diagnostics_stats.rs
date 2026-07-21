@@ -9,7 +9,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 use futures_util::StreamExt;
-use heaplens_protocol::{AllocEvent, EventKind, GraphMessage};
+use heaplens_protocol::{AllocEvent, ControlResponse, EventKind, GraphMessage};
 use heaplens_daemon::{
     graph::OwnershipGraph,
     msg::{ConnectRequest, GraphMsg},
@@ -83,10 +83,11 @@ async fn run_graph_loop(
                         resolver.insert(addr, name, is_machinery);
                     }
                 }
-                Some(GraphMsg::Handshake { pid, name }) => {
+                Some(GraphMsg::TargetConnected { pid, name }) => {
                     target_pid = Some(pid);
                     target_name = Some(name);
                 }
+                Some(GraphMsg::TargetDisconnected { .. }) => {}
                 Some(GraphMsg::Tick) => {
                     let diff = graph.drain_diff(&resolver);
                     if is_non_empty_diff(&diff) {
@@ -131,8 +132,12 @@ async fn start_test_server() -> (
     let (graph_tx, graph_rx) = mpsc::unbounded_channel::<GraphMsg>();
     let (connect_tx, connect_rx) = mpsc::unbounded_channel::<ConnectRequest>();
     let (broadcast_tx, _) = broadcast::channel::<Arc<GraphMessage>>(64);
+    // These tests don't exercise the control channel — see ws_tests.rs's
+    // identical rationale on its own unused target_tx/control_push_tx.
+    let (target_tx, _target_rx) = mpsc::unbounded_channel();
+    let (control_push_tx, _) = broadcast::channel::<Arc<ControlResponse>>(16);
 
-    tokio::spawn(server::run(addr.clone(), connect_tx));
+    tokio::spawn(server::run(addr.clone(), connect_tx, target_tx, control_push_tx));
     let handle = tokio::spawn(run_graph_loop(graph_rx, connect_rx, broadcast_tx));
 
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -186,7 +191,7 @@ async fn stats_reports_symbol_resolution_and_handshake_identity() {
         ]))
         .unwrap();
     graph_tx
-        .send(GraphMsg::Handshake { pid: 4242, name: "target.exe".to_owned() })
+        .send(GraphMsg::TargetConnected { pid: 4242, name: "target.exe".to_owned() })
         .unwrap();
     graph_tx.send(GraphMsg::Tick).unwrap();
 

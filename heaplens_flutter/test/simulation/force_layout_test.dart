@@ -9,6 +9,7 @@ import 'dart:math';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:heaplens_flutter/models/node.dart';
 import 'package:heaplens_flutter/simulation/force_layout.dart';
+import 'package:vector_math/vector_math.dart' show Vector2;
 
 NodeDto _node({
   required int id,
@@ -33,6 +34,46 @@ NodeDto _node({
 }
 
 void main() {
+  group('radiusForSize', () {
+    test('clamps to kMinNodeRadius/kMaxNodeRadius at the extremes', () {
+      expect(radiusForSize(0), kMinNodeRadius);
+      expect(radiusForSize(1), greaterThanOrEqualTo(kMinNodeRadius));
+      expect(radiusForSize(100000000), kMaxNodeRadius);
+    });
+
+    test('is monotonically non-decreasing across realistic allocation sizes', () {
+      const sizes = [1, 8, 16, 32, 64, 128, 256, 500, 1024, 4096, 65536, 1048576];
+      var previous = radiusForSize(0);
+      for (final size in sizes) {
+        final radius = radiusForSize(size);
+        expect(
+          radius,
+          greaterThanOrEqualTo(previous),
+          reason: 'radius must not shrink as size grows (size=$size)',
+        );
+        previous = radius;
+      }
+    });
+
+    test(
+      'spreads the realistic byte-to-kilobyte range across meaningfully '
+      'different radii, not clustered at the floor',
+      () {
+        // This is the actual bug being fixed: every workload used
+        // throughout this project's own testing allocates 1-500 bytes,
+        // and the old sqrt-based curve put nearly all of them within a
+        // couple pixels of kMinNodeRadius. A 32-byte node and a 500-byte
+        // node should now read as visibly different sizes.
+        final small = radiusForSize(32);
+        final medium = radiusForSize(500);
+        final large = radiusForSize(65536);
+
+        expect(medium - small, greaterThan(4.0));
+        expect(large - medium, greaterThan(4.0));
+      },
+    );
+  });
+
   group('addNode spawn positioning', () {
     test('spawns within jitter radius of owner position', () {
       final layout = ForceLayout(
@@ -324,5 +365,122 @@ void main() {
       // Should have contracted substantially from 500 toward ~restLength.
       expect(dist, lessThan(500));
     });
+  });
+
+  group('collision resolution (overlap fix)', () {
+    test(
+      'disconnected roots (no edges) spread out with no overlapping circles',
+      () {
+        // The reported "blob" case: many healthy roots, no springs holding
+        // any of them together, all initially spawned near the same point.
+        final layout = ForceLayout(centerX: 400, centerY: 300, random: Random(7));
+        final nodes = <int, NodeDto>{
+          for (var i = 0; i < 25; i++)
+            i: _node(id: i, size: 200 + i * 300, symbol: 'root_$i'),
+        };
+        for (final node in nodes.values) {
+          layout.addNode(node, nodes);
+          // Force everyone to spawn on top of each other, worse than the
+          // real jittered spawn — the harder version of the reported bug.
+          layout.simNodes[node.id]!.position.setValues(400, 300);
+        }
+
+        for (var i = 0; i < 400; i++) {
+          layout.step(0.016);
+        }
+
+        final ids = layout.simNodes.keys.toList();
+        for (var i = 0; i < ids.length; i++) {
+          for (var j = i + 1; j < ids.length; j++) {
+            final a = layout.simNodes[ids[i]]!;
+            final b = layout.simNodes[ids[j]]!;
+            final dist = (a.position - b.position).length;
+            final minDist = a.radius + b.radius;
+            expect(
+              dist,
+              greaterThanOrEqualTo(minDist - 0.5), // small float tolerance
+              reason:
+                  'nodes ${ids[i]} and ${ids[j]} still overlap after settling',
+            );
+          }
+        }
+
+        // Not just non-overlapping — actually spread into a field, not
+        // pinned in a tight pile at the spawn point.
+        final maxDistFromCenter = ids
+            .map((id) => (layout.simNodes[id]!.position - Vector2(400, 300)).length)
+            .reduce(max);
+        expect(maxDistFromCenter, greaterThan(60));
+      },
+    );
+
+    test(
+      'high-fan-out star stays a recognizable hub-and-spokes, no overlap, '
+      'no central pile-up',
+      () {
+        // One owner with many children — springs pull children toward the
+        // owner, which is exactly the shape collision resolution must not
+        // blow apart, while still not letting the children overlap each
+        // other or the owner at the center.
+        final layout = ForceLayout(centerX: 400, centerY: 300, random: Random(3));
+        final childIds = List.generate(40, (i) => i + 1);
+        final owner = _node(id: 0, size: 500, edges: childIds);
+        final nodes = <int, NodeDto>{
+          0: owner,
+          for (final id in childIds) id: _node(id: id, size: 300),
+        };
+
+        layout.addNode(owner, nodes);
+        for (final id in childIds) {
+          layout.addNode(nodes[id]!, nodes);
+        }
+
+        for (var i = 0; i < 400; i++) {
+          layout.step(0.016);
+        }
+
+        final ownerPos = layout.simNodes[0]!.position;
+        final ownerRadius = layout.simNodes[0]!.radius;
+
+        // No overlap anywhere, including owner-vs-child.
+        final ids = layout.simNodes.keys.toList();
+        for (var i = 0; i < ids.length; i++) {
+          for (var j = i + 1; j < ids.length; j++) {
+            final a = layout.simNodes[ids[i]]!;
+            final b = layout.simNodes[ids[j]]!;
+            final dist = (a.position - b.position).length;
+            final minDist = a.radius + b.radius;
+            expect(
+              dist,
+              greaterThanOrEqualTo(minDist - 0.5),
+              reason:
+                  'nodes ${ids[i]} and ${ids[j]} still overlap after settling',
+            );
+          }
+        }
+
+        // Still a star, not blown apart: every child stays within a bounded
+        // radius of the owner, not scattered across the whole canvas. The
+        // bound is generous (not exactly kSpringRestLength) because 40
+        // non-overlapping child circles physically cannot all pack into a
+        // ring at the spring's exact rest length — collision resolution
+        // legitimately pushes some further out to make room. What this
+        // guards against is the real "blown apart" pathology: children
+        // ending up scattered arbitrarily far away.
+        for (final id in childIds) {
+          final dist = (layout.simNodes[id]!.position - ownerPos).length;
+          expect(
+            dist,
+            lessThan(kSpringRestLength * 5),
+            reason: 'child $id drifted far from its owner — star was blown apart',
+          );
+          expect(
+            dist,
+            greaterThanOrEqualTo(ownerRadius),
+            reason: 'child $id is inside the owner\'s own drawn circle',
+          );
+        }
+      },
+    );
   });
 }

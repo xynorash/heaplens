@@ -74,7 +74,9 @@ async fn cross_process_wire_end_to_end() {
     drop(ws_listener);
     let ws_addr = format!("127.0.0.1:{ws_port}");
 
-    tokio::spawn(server::run(ws_addr.clone(), connect_tx));
+    let (target_tx, _target_rx) = mpsc::unbounded_channel();
+    let (control_push_tx, _) = broadcast::channel::<Arc<heaplens_protocol::ControlResponse>>(16);
+    tokio::spawn(server::run(ws_addr.clone(), connect_tx, target_tx, control_push_tx));
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     // Start the pipe server BEFORE spawning the child.
@@ -153,10 +155,12 @@ async fn cross_process_wire_end_to_end() {
                         }
                     }
                     // The real producer sends a HANDSHAKE frame on connect,
-                    // now forwarded by ingest.rs instead of discarded — this
-                    // must not be treated as end-of-stream by the catch-all
-                    // below (it isn't a connection close).
-                    Some(GraphMsg::Handshake { .. }) => continue,
+                    // now forwarded by ingest.rs as GraphMsg::TargetConnected
+                    // instead of discarded — this must not be treated as
+                    // end-of-stream by the catch-all below (it isn't a
+                    // connection close). TargetDisconnected is the pipe-close
+                    // counterpart and is equally not end-of-stream here.
+                    Some(GraphMsg::TargetConnected { .. }) | Some(GraphMsg::TargetDisconnected { .. }) => continue,
                     _ => break,
                 },
                 req = connect_rx.recv() => {

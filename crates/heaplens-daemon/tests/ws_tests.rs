@@ -2,7 +2,7 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 use futures_util::StreamExt;
-use heaplens_protocol::{AllocEvent, EventKind, GraphMessage};
+use heaplens_protocol::{AllocEvent, ControlResponse, EventKind, GraphMessage};
 use heaplens_daemon::{
     graph::OwnershipGraph,
     msg::{ConnectRequest, GraphMsg},
@@ -52,7 +52,7 @@ async fn run_graph_loop(
                     }
                 }
                 Some(GraphMsg::Symbols(_)) => {}
-                Some(GraphMsg::Handshake { .. }) => {}
+                Some(GraphMsg::TargetConnected { .. }) | Some(GraphMsg::TargetDisconnected { .. }) => {}
                 Some(GraphMsg::Tick) => {
                     let diff = graph.drain_diff(&resolver);
                     if is_non_empty_diff(&diff) {
@@ -90,8 +90,13 @@ async fn start_test_server() -> (
     let (graph_tx, graph_rx) = mpsc::unbounded_channel::<GraphMsg>();
     let (connect_tx, connect_rx) = mpsc::unbounded_channel::<ConnectRequest>();
     let (broadcast_tx, _) = broadcast::channel::<Arc<GraphMessage>>(64);
+    // These tests don't exercise the control channel — a target_tx with no
+    // receiver just means ListProcesses/Attach/Detach requests (none are
+    // sent here) would silently no-op rather than panic.
+    let (target_tx, _target_rx) = mpsc::unbounded_channel();
+    let (control_push_tx, _) = broadcast::channel::<Arc<ControlResponse>>(16);
 
-    tokio::spawn(server::run(addr.clone(), connect_tx));
+    tokio::spawn(server::run(addr.clone(), connect_tx, target_tx, control_push_tx));
 
     let handle = tokio::spawn(run_graph_loop(graph_rx, connect_rx, broadcast_tx));
 

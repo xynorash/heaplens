@@ -91,6 +91,12 @@ class GraphNotifier extends Notifier<int> {
   /// Number of nodes currently marked `live`.
   int get liveNodeCount => _nodes.values.where((n) => n.live).length;
 
+  /// Number of live nodes that own at least one other node (a non-empty
+  /// `edges` list) — the top bar's plain-language "Owners" metric. Purely
+  /// derived from data already present client-side; not a new wire field.
+  int get ownerCount =>
+      _nodes.values.where((n) => n.live && n.edges.isNotEmpty).length;
+
   /// Sum of `size` across all `live` nodes.
   int get totalLiveBytes => _nodes.values
       .where((n) => n.live)

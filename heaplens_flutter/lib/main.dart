@@ -8,13 +8,14 @@ import 'models/graph_diff.dart';
 import 'providers/force_layout_provider.dart';
 import 'providers/graph_provider.dart';
 import 'providers/paused_provider.dart';
-import 'providers/selection_provider.dart';
 import 'providers/view_mode_provider.dart';
 import 'providers/ws_provider.dart';
+import 'theme/xynorash_theme.dart';
 import 'widgets/control_bar.dart';
 import 'widgets/graph_canvas.dart';
+import 'widgets/insights_panel.dart';
 import 'widgets/memory_map.dart';
-import 'widgets/node_detail.dart';
+import 'widgets/right_rail.dart';
 import 'widgets/target_status_banner.dart';
 
 void main() {
@@ -32,9 +33,7 @@ class HeapLensApp extends StatelessWidget {
     return MaterialApp(
       title: 'HeapLens',
       debugShowCheckedModeBanner: false,
-      theme: ThemeData.dark(useMaterial3: true).copyWith(
-        scaffoldBackgroundColor: const Color(0xFF121212),
-      ),
+      theme: XynorashTheme.darkTheme(),
       home: const _GraphOrchestrator(child: HeapLensHome()),
     );
   }
@@ -226,43 +225,76 @@ class _GraphOrchestratorState extends ConsumerState<_GraphOrchestrator> {
   }
 }
 
-/// Top-level page layout: control bar across the top, the graph canvas or
-/// memory map filling the center (toggled by [viewModeProvider]), and a
-/// collapsible node-detail panel on the right (hidden entirely when nothing
-/// is selected).
+/// Top-level page layout: the ribbon ([ControlBar]) across the top, then a
+/// row filling the rest of the window edge to edge — left region (graph
+/// on top, Insights & Suggestions panel beneath, full width of that
+/// region) and the right rail ([RightRail]), always present and always
+/// expanded (no collapse/accordion anywhere in this layout — each panel
+/// handles its own empty state instead).
 class HeapLensHome extends ConsumerWidget {
   const HeapLensHome({super.key});
 
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final viewMode = ref.watch(viewModeProvider);
-    final selectedId = ref.watch(selectedNodeIdProvider);
     final layout = ref.watch(forceLayoutProvider);
+    final status = ref.watch(connectionStatusProvider);
+    ref.watch(graphProvider); // rebuild when the node map changes
+    final liveNodeCount = ref.read(graphProvider.notifier).liveNodeCount;
 
     return Scaffold(
       body: SafeArea(
         child: Stack(
           children: [
             Column(
+              // Column's default cross-axis alignment does not stretch
+              // children to the full available width — without this, the
+              // ribbon (ControlBar) sized itself to just its five cells'
+              // intrinsic width, leaving blank space to the right instead
+              // of reaching the window's right edge.
+              crossAxisAlignment: CrossAxisAlignment.stretch,
               children: [
                 const ControlBar(),
                 const TargetStatusBanner(),
                 Expanded(
                   child: Row(
+                    // Same fix as the ribbon: Row's default cross-axis
+                    // alignment doesn't stretch children to the full
+                    // available height, so the right rail (a fixed-width,
+                    // content-height Container) sized itself to its own
+                    // content instead of reaching the window's bottom
+                    // edge, leaving a dead black gap below the last
+                    // section.
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
                     children: [
                       Expanded(
-                        child: switch (viewMode) {
-                          ViewMode.graph => GraphCanvas(layout: layout),
-                          ViewMode.memoryMap => const MemoryMap(),
-                        },
-                      ),
-                      if (selectedId != null)
-                        Container(
-                          key: const Key('nodeDetailPanel'),
-                          width: 320,
-                          color: const Color(0xFF1A1A1A),
-                          child: const NodeDetail(),
+                        child: Column(
+                          children: [
+                            Expanded(
+                              flex: 3,
+                              child: Stack(
+                                children: [
+                                  Positioned.fill(
+                                    child: switch (viewMode) {
+                                      ViewMode.graph => GraphCanvas(layout: layout),
+                                      ViewMode.memoryMap => const MemoryMap(),
+                                    },
+                                  ),
+                                  // Explicit waiting state, not a blank
+                                  // canvas, while there's no target
+                                  // producing data yet.
+                                  if (status != ConnectionStatus.connected &&
+                                      liveNodeCount == 0)
+                                    const _WaitingForDaemon(),
+                                ],
+                              ),
+                            ),
+                            const Divider(height: 1, color: Colors.white12),
+                            const Expanded(flex: 2, child: InsightsPanel()),
+                          ],
                         ),
+                      ),
+                      const RightRail(),
                     ],
                   ),
                 ),
@@ -271,6 +303,24 @@ class HeapLensHome extends ConsumerWidget {
             if (kShowDebugOverlay) const DebugOverlay(),
           ],
         ),
+      ),
+    );
+  }
+}
+
+class _WaitingForDaemon extends StatelessWidget {
+  const _WaitingForDaemon();
+
+  @override
+  Widget build(BuildContext context) {
+    return const Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(Icons.hourglass_empty, size: 32, color: Colors.white24),
+          SizedBox(height: 8),
+          Text('Waiting for daemon…', style: TextStyle(color: Colors.white38)),
+        ],
       ),
     );
   }

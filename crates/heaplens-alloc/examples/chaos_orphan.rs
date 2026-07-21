@@ -22,7 +22,18 @@ fn main() {
 
     let children = make_children();
 
-    std::thread::sleep(Duration::from_millis(300));
+    // Healthy hold: owner + children all live, nothing orphaned yet — a
+    // human (or a screenshot) watching the graph should see a plain healthy
+    // star for a full 15s before anything changes. Ticks every 20ms (not a
+    // single sleep) to keep max_ts_seen advancing — anomaly age is computed
+    // from event timestamps only, never wall-clock (see demo_producer.rs).
+    let healthy_start = Instant::now();
+    while healthy_start.elapsed() < Duration::from_millis(15_000) {
+        let hb = vec![0u8; 8];
+        std::hint::black_box(&hb);
+        drop(hb);
+        std::thread::sleep(Duration::from_millis(20));
+    }
 
     // SAFETY: owner_ptr came from Box::into_raw immediately above and is
     // freed exactly once, here.

@@ -14,10 +14,24 @@ fn leaf_alloc(n: usize) -> Vec<u8> {
 /// One owner allocation, followed by `n_children` leaf allocations from the
 /// same call site inside this frame — phi should infer all of them as owned
 /// by `owner`.
+///
+/// The `children` container's own backing storage (`Vec::with_capacity`)
+/// must be allocated *before* `owner`, not after: it allocates at this same
+/// call site (`make_family`), so it is also a same-symbol candidate phi
+/// considers when attributing each child. Phi's tie-break picks the most
+/// recent same-symbol candidate — if `Vec::with_capacity` ran after `owner`,
+/// it would win that tie-break instead of `owner`, and every child would be
+/// (mis)attributed to the children container itself rather than to `owner`.
+/// Since that container isn't freed until `children` is dropped — at the
+/// same time as the children themselves — the owner-freed/children-orphaned
+/// transition this scenario exists to demonstrate would never actually be
+/// observable: everything would appear to die together in one bulk removal
+/// instead of orphaning at T+60s. Allocating it first gives `owner` the
+/// later timestamp, so it correctly wins the tie-break.
 #[inline(never)]
 fn make_family(n_children: usize) -> (Vec<u8>, Vec<Vec<u8>>) {
-    let owner = vec![0u8; 4096];
     let mut children = Vec::with_capacity(n_children);
+    let owner = vec![0u8; 4096];
     for _ in 0..n_children {
         children.push(leaf_alloc(128));
     }
