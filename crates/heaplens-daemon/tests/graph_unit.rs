@@ -1,4 +1,6 @@
-use heaplens_protocol::{AllocEvent, EventKind, GraphMessage};
+use heaplens_protocol::{AllocEvent, EventKind, GraphMessage, NodeState};
+use heaplens_daemon::anomaly::sweep;
+use heaplens_daemon::config::Config;
 use heaplens_daemon::graph::OwnershipGraph;
 use heaplens_daemon::resolver::Resolver;
 
@@ -482,4 +484,108 @@ fn drain_diff_uses_placeholder_for_unresolved_symbol() {
     let diff = g.drain_diff(&r);
     let (add, _, _) = unwrap_diff(diff);
     assert_eq!(add[0].symbol, "?");
+}
+
+// Targeted invariant test for the node-eviction fix (2026-07-22, daemon
+// memory/O(N²) leak): drives a full parent+child lifecycle — alloc parent,
+// alloc child (owned), free parent, an orphan transition, free child —
+// across four separate ticks, and asserts `self.nodes.len()` at every
+// step, not just that it eventually reaches zero. This is what proves
+// eviction is *safe* (drain_diff/sweep output at each tick is exactly what
+// pre-fix behavior would have produced) rather than merely that memory
+// shrinks — a test that only checked the final count could pass even if
+// eviction happened too early and silently corrupted a tick's diff.
+#[test]
+fn dead_nodes_are_evicted_without_changing_diff_or_orphan_detection() {
+    let owner_site = 0xAAAA;
+    let leaf_site = 0xBBBB;
+    let r = resolver_with_real_sites(&[owner_site, leaf_site]);
+    let mut g = OwnershipGraph::new();
+    let config = Config {
+        tau_ms: 5, // 5ms -> 5_000_000ns, matches orphan_persistence.rs's test
+        hot_cluster_threshold: 32,
+        storm_rate_threshold: 1000,
+        storm_window_ms: 1000,
+        pipe_name: r"\\.\pipe\heaplens".to_owned(),
+        tick_ms: 33,
+        ws_addr: "127.0.0.1:9999".to_owned(),
+        db_path: "heaplens.db".to_owned(),
+    };
+
+    // ── Tick 1: parent and child both born ──────────────────────────────
+    g.on_alloc(&make_ev(EventKind::Alloc, 0x1000, 0, 64, 0, &[owner_site]), &r);
+    g.on_alloc(&make_ev(EventKind::Alloc, 0x2000, 0, 32, 1, &[leaf_site, owner_site]), &r);
+    let parent_id = g.node_by_ptr(0x1000).unwrap().id;
+    let child_id = g.node_by_ptr(0x2000).unwrap().id;
+
+    let diff1 = g.drain_diff(&r);
+    let (add1, update1, remove1) = unwrap_diff(diff1);
+    assert_eq!(add1.len(), 2, "tick 1: both parent and child must be in add");
+    assert!(update1.is_empty() && remove1.is_empty());
+    assert_eq!(g.nodes().len(), 2, "tick 1: both nodes present after drain, nothing evicted yet");
+
+    // ── Tick 2: parent freed — child orphaned (owner cleared), parent
+    //    must be evicted from self.nodes right after this drain, while the
+    //    diff itself is byte-identical to what pre-fix behavior produced
+    //    (mirrors dealloc_orphans_children's exact assertions). ──────────
+    g.on_dealloc(0x1000, 10);
+    let diff2 = g.drain_diff(&r);
+    let (add2, update2, remove2) = unwrap_diff(diff2);
+    assert!(add2.is_empty(), "tick 2: nothing new born");
+    assert_eq!(remove2, vec![parent_id], "tick 2: parent must be the only removed id");
+    assert_eq!(update2.len(), 1, "tick 2: child must be the only updated node");
+    assert_eq!(update2[0].id, child_id);
+
+    assert_eq!(
+        g.nodes().len(), 1,
+        "tick 2: parent must be evicted from self.nodes right after this drain \
+         (this is the actual fix under test) — child must remain (still live)"
+    );
+    let child = g.node_by_ptr(0x2000).expect("child still live and findable by ptr");
+    assert!(child.owner.is_none() && child.had_owner_once, "child correctly orphaned by on_dealloc");
+    assert_eq!(child.owner_free_ts, Some(10));
+
+    // ── Tick 3: enough time passes for sweep() to flip the child to
+    //    Orphan — proves anomaly detection is unaffected by the parent's
+    //    prior eviction (nothing about orphan classification ever needed
+    //    to read the dead parent's Node struct — it only reads the live
+    //    child's own owner/had_owner_once/ts fields). ────────────────────
+    const ORPHAN_DETECTED_TS_NS: u64 = 10 + 6_000_000; // owner_free_ts + tau_ms(5ms) + margin
+    g.on_alloc(&make_ev(EventKind::Alloc, 0x3000, 0, 8, ORPHAN_DETECTED_TS_NS, &[0xCCCC]), &r);
+    let sentinel_id = g.node_by_ptr(0x3000).unwrap().id;
+
+    let max_ts = g.max_ts_seen;
+    let changed = sweep(g.nodes_mut(), max_ts, &config);
+    assert_eq!(changed, vec![child_id], "only the child's state should flip, to Orphan");
+    assert_eq!(g.nodes().get(&child_id).unwrap().state, NodeState::Orphan);
+    g.mark_updated(child_id); // exactly what main.rs's Tick handler does for each changed id
+
+    let diff3 = g.drain_diff(&r);
+    let (add3, update3, remove3) = unwrap_diff(diff3);
+    assert_eq!(add3.len(), 1, "tick 3: only the sentinel alloc is new");
+    assert_eq!(add3[0].id, sentinel_id);
+    assert!(remove3.is_empty());
+    assert_eq!(update3.len(), 1, "tick 3: child's Orphan transition must be reported");
+    assert_eq!(update3[0].id, child_id);
+    assert_eq!(update3[0].state, NodeState::Orphan);
+
+    assert_eq!(
+        g.nodes().len(), 2,
+        "tick 3: child (still live, now Orphan) and the sentinel both present; \
+         nothing evicted this tick since nothing died"
+    );
+
+    // ── Tick 4: child finally freed too — must also be evicted, proving
+    //    the fix applies uniformly, not just to nodes that die alone. ────
+    g.on_dealloc(0x2000, ORPHAN_DETECTED_TS_NS + 1);
+    let diff4 = g.drain_diff(&r);
+    let (add4, update4, remove4) = unwrap_diff(diff4);
+    assert!(add4.is_empty() && update4.is_empty());
+    assert_eq!(remove4, vec![child_id], "tick 4: child must be the only removed id");
+
+    assert_eq!(
+        g.nodes().len(), 1,
+        "tick 4: child evicted; only the still-live sentinel remains — \
+         the graph does not leak across a full parent+child+orphan lifecycle"
+    );
 }

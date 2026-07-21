@@ -192,7 +192,42 @@ impl OwnershipGraph {
 
         self.added.clear();
         self.updated.clear();
-        self.removed.clear();
+
+        // Evict dead nodes from `self.nodes` now — the fix for the
+        // unbounded-growth/O(N²) `infer_ownership` scan defect (confirmed
+        // 2026-07-22: `on_dealloc` never removed nodes at all, so every
+        // allocation ever seen became a permanent HashMap entry, and
+        // `infer_ownership`'s per-allocation scan over `self.nodes.values()`
+        // got slower as history piled up — total_nodes reached 102,225 with
+        // live_nodes at 7 on a provably alloc/free-balanced workload, and
+        // the daemon fell 49 seconds behind its own event stream).
+        //
+        // Safe exactly here, not sooner and not later — every reader of
+        // `self.nodes` was checked (not assumed) before choosing this point:
+        //   - `add`/`update` above already exclude any id in `removed_set`
+        //     before calling `self.nodes.get()` — a node dying this tick
+        //     (whether born this tick or earlier) is never read by them.
+        //   - `remove` above never calls `self.nodes.get()` at all — it only
+        //     copies ids out of `self.removed`.
+        //   - `sweep` (anomaly.rs) and `infer_ownership` both filter on
+        //     `n.live` before touching anything else — a dead node is inert
+        //     to both regardless of whether it's still in the map.
+        //   - `on_dealloc`'s own children-reorphaning scan also filters on
+        //     `n.live` — and by the time a node reaches `self.removed`,
+        //     `on_dealloc` has already unlinked it in both directions (its
+        //     owner's `edges_out` no longer references it; its own children,
+        //     if any, already had their `owner` cleared) — so no live node
+        //     holds a dangling reference to an id evicted here.
+        // Evicting any earlier (e.g. directly in `on_dealloc`) would also be
+        // safe by this same accounting, but would remove a node mid-tick,
+        // before `add`/`update` have run for it this same tick — leaving
+        // strictly less margin for a future change to this function to
+        // silently start relying on that read. Evicting here keeps a node
+        // visible in `self.nodes` for the exact duration current diff/sweep
+        // logic can observe it, and gone the instant that window closes.
+        for id in self.removed.drain(..) {
+            self.nodes.remove(&id);
+        }
 
         GraphMessage::Diff { ts, add, update, remove }
     }
