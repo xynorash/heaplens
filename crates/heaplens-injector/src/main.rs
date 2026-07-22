@@ -11,6 +11,8 @@
 use std::ffi::c_void;
 use std::path::{Path, PathBuf};
 
+mod safety;
+
 use windows_sys::Win32::Foundation::{CloseHandle, FreeLibrary, HANDLE};
 use windows_sys::Win32::System::Diagnostics::Debug::{ReadProcessMemory, WriteProcessMemory};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
@@ -203,6 +205,15 @@ fn load_library_w_addr() -> *const c_void {
 }
 
 fn attach(pid: u32) {
+    // Hard exclusion (2026-07-22): refuse before requesting any
+    // injection-capable rights on the target — see safety.rs's module doc
+    // comment for the three signals checked and why. This is unconditional;
+    // there is deliberately no override flag. (Each check's own message
+    // already names the pid and says "refusing" — nothing to add here.)
+    if let Err(reason) = safety::check(pid) {
+        fail(reason);
+    }
+
     let dll = dll_path();
     if !dll.exists() {
         fail(format!("{DLL_NAME} not found at {dll:?} — expected next to heaplens-injector.exe"));

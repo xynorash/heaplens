@@ -398,20 +398,30 @@ class _ConnectionIndicator extends StatelessWidget {
   }
 }
 
-/// Cross-process attachment is disabled in this build following a
-/// confirmed, reproducible hook defect (crash under concurrent
-/// multi-threaded allocation load, corroborated by a real-world crash
-/// recorded inside heaplens_hook.dll and a kernel bugcheck) — see
-/// README.txt. This gate gets flipped back once the defect is fixed;
-/// until then the "Attach" entry point must stay visibly present but
-/// disabled, not silently removed, so a user sees *why* rather than
-/// wondering if the button vanished by accident.
-const bool kAttachEnabled = false;
+/// Cross-process attachment (2026-07-22): re-enabled after the hook defect
+/// that previously forced this gate off (crash under concurrent
+/// multi-threaded allocation load) was root-caused, fixed, and validated —
+/// TLS/FLS dynamic-loading corruption fixed and proven via self-load and
+/// real cross-process injection; a three-layer memory/performance chain
+/// found and fixed, proven to plateau over a 2h10m real-world soak; a
+/// pre-attach kernel-driver-target detector implemented and validated
+/// against real software. See README.txt for the full evidence trail.
+/// `kAttachEnabled` stays a single flippable gate (not deleted) so a future
+/// regression can disable the entry point the same visible, honest way
+/// this one was — present but disabled with a reason, never silently
+/// removed.
+const bool kAttachEnabled = true;
 const String kAttachDisabledReason =
     'Process attachment is temporarily disabled in this build — a confirmed '
     'hook defect was found during testing (crash under concurrent '
     'multi-threaded allocation). See README.txt. The cooperative capture '
     'path used by the bundled example producers is unaffected.';
+const String kAttachEnabledInfo =
+    'Process attachment is enabled. HeapLens automatically refuses '
+    'processes with kernel-mode driver components (VPN/anti-cheat/security '
+    'software) for safety. Validated against real-world software (native, '
+    'Electron, Node/V8) for sessions up to 2+ hours; longer-duration or '
+    'highly specialized targets are less tested.';
 
 /// "Attach to Process…" button when nothing is attached, or a compact
 /// "attached" indicator plus a Detach button when one is. The full
@@ -434,10 +444,14 @@ class _AttachControl extends StatelessWidget {
         label: const Text('Attach'),
         onPressed: kAttachEnabled ? () => showProcessPickerDialog(context) : null,
       );
-      if (kAttachEnabled) return button;
+      // A tooltip is present either way — replaced, never removed, when the
+      // gate flips (see kAttachEnabled's doc comment). Disabled: why the
+      // button can't be pressed. Enabled: the tool's actual, honestly-scoped
+      // capability and its known safety boundary — this is the only surface
+      // most users will ever see that information on before clicking Attach.
       return Tooltip(
-        key: const Key('attachDisabledTooltip'),
-        message: kAttachDisabledReason,
+        key: Key(kAttachEnabled ? 'attachEnabledTooltip' : 'attachDisabledTooltip'),
+        message: kAttachEnabled ? kAttachEnabledInfo : kAttachDisabledReason,
         child: button,
       );
     }
