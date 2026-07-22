@@ -4,21 +4,28 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import '../models/target_diagnosis.dart';
 import '../providers/target_diagnostics_provider.dart';
 import '../providers/view_mode_provider.dart';
+import '../theme/xynorash_theme.dart';
 
 /// Colors for each non-[TargetStatus.capturing] state — [noEvents] reads as
 /// a caution amber (target may simply be idle, not necessarily a problem),
 /// [noEdges]/[unsymbolized] read as an informational blue (capturing is
 /// working; the limitation is inherent to the target, not an error).
+/// [noEdgesOrphaned] reuses the shared orphan coral ([kNodeStateColors]) —
+/// same semantic as every other orphan indicator in the app, since this
+/// state literally means "most of the graph is orphaned", not a capture
+/// problem.
 const Map<TargetStatus, Color> _kBannerColors = {
   TargetStatus.noEvents: Color(0xFFB08900),
   TargetStatus.noEdges: Color(0xFF2D6CA6),
   TargetStatus.unsymbolized: Color(0xFF2D6CA6),
+  TargetStatus.noEdgesOrphaned: XynorashTheme.coral,
 };
 
 const Map<TargetStatus, IconData> _kBannerIcons = {
   TargetStatus.noEvents: Icons.hourglass_empty,
   TargetStatus.noEdges: Icons.hub_outlined,
   TargetStatus.unsymbolized: Icons.hub_outlined,
+  TargetStatus.noEdgesOrphaned: Icons.link_off,
 };
 
 /// Honest target-diagnostic banner: explains *why* the graph looks empty or
@@ -43,7 +50,8 @@ class TargetStatusBanner extends ConsumerWidget {
     final color = _kBannerColors[diagnosis.status]!;
     final icon = _kBannerIcons[diagnosis.status]!;
     final showMapViewAction = diagnosis.status == TargetStatus.noEdges ||
-        diagnosis.status == TargetStatus.unsymbolized;
+        diagnosis.status == TargetStatus.unsymbolized ||
+        diagnosis.status == TargetStatus.noEdgesOrphaned;
 
     return Material(
       key: const Key('targetStatusBanner'),

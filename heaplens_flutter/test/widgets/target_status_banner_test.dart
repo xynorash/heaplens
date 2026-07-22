@@ -11,7 +11,11 @@ import 'package:heaplens_flutter/providers/view_mode_provider.dart';
 import 'package:heaplens_flutter/providers/ws_provider.dart';
 import 'package:heaplens_flutter/widgets/target_status_banner.dart';
 
-NodeDto _node({required int id, List<int> edges = const []}) {
+NodeDto _node({
+  required int id,
+  List<int> edges = const [],
+  NodeStateDto state = NodeStateDto.healthy,
+}) {
   return NodeDto(
     id: id,
     ptr: id,
@@ -19,7 +23,7 @@ NodeDto _node({required int id, List<int> edges = const []}) {
     ts: 0,
     symbol: 'sym',
     live: true,
-    state: NodeStateDto.healthy,
+    state: state,
     edges: edges,
   );
 }
@@ -127,5 +131,32 @@ void main() {
     await tester.tap(find.byKey(const Key('switchToMapViewButton')));
     await tester.pump();
     expect(container.read(viewModeProvider), ViewMode.memoryMap);
+  });
+
+  testWidgets(
+      'all nodes orphaned with symbols fully resolved: shows the '
+      'orphan-explained message, not the symbol-envelope one, and still '
+      'offers Switch to Map view', (tester) async {
+    final controller = StreamController<GraphMessage>();
+    addTearDown(() => controller.close());
+    final container = await _pumpBanner(tester, controller);
+
+    container.read(graphProvider.notifier).applyDiff(
+      GraphSnapshot(
+        ts: 1,
+        nodes: List.generate(
+          10,
+          (i) => _node(id: i, state: NodeStateDto.orphan),
+        ),
+      ),
+    );
+    controller.add(const GraphStats(ts: 1, eventsReceived: 500, symbolsResolved: 10, hexFallback: 0));
+    await tester.pump();
+    await tester.pump();
+
+    expect(find.byKey(const Key('targetStatusBanner')), findsOneWidget);
+    expect(find.textContaining('lacks the debug symbols'), findsNothing);
+    expect(find.textContaining('currently orphaned'), findsOneWidget);
+    expect(find.byKey(const Key('switchToMapViewButton')), findsOneWidget);
   });
 }

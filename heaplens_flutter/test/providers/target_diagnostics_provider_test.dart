@@ -9,7 +9,12 @@ import 'package:heaplens_flutter/providers/graph_provider.dart';
 import 'package:heaplens_flutter/providers/target_diagnostics_provider.dart';
 import 'package:heaplens_flutter/providers/ws_provider.dart';
 
-NodeDto _node({required int id, bool live = true, List<int> edges = const []}) {
+NodeDto _node({
+  required int id,
+  bool live = true,
+  List<int> edges = const [],
+  NodeStateDto state = NodeStateDto.healthy,
+}) {
   return NodeDto(
     id: id,
     ptr: id,
@@ -17,7 +22,7 @@ NodeDto _node({required int id, bool live = true, List<int> edges = const []}) {
     ts: 0,
     symbol: 'sym',
     live: live,
-    state: NodeStateDto.healthy,
+    state: state,
     edges: edges,
   );
 }
@@ -126,6 +131,32 @@ void main() {
       await Future<void>.delayed(Duration.zero);
 
       expect(container.read(targetDiagnosticsProvider).status, TargetStatus.noEdges);
+    });
+
+    test('nodes mostly orphaned (via graphProvider), symbols fully resolved: '
+        'noEdgesOrphaned, not the symbol-envelope message', () async {
+      container.read(graphProvider.notifier).applyDiff(
+        GraphSnapshot(
+          ts: 1,
+          nodes: List.generate(
+            10,
+            (i) => _node(id: i, state: NodeStateDto.orphan),
+          ),
+        ),
+      );
+
+      controller.add(const GraphStats(
+        ts: 1,
+        eventsReceived: 500,
+        symbolsResolved: 10,
+        hexFallback: 0,
+      ));
+      await Future<void>.delayed(Duration.zero);
+
+      final diag = container.read(targetDiagnosticsProvider);
+      expect(diag.status, TargetStatus.noEdgesOrphaned);
+      expect(diag.message, isNot(contains('lacks the debug symbols')));
+      expect(diag.message, contains('10 of 10 allocations are currently orphaned'));
     });
 
     test('predominantly hex-fallback symbols alongside no edges: unsymbolized, folded into the noEdges message', () async {

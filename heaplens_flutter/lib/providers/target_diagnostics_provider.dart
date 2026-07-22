@@ -1,6 +1,7 @@
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 
 import '../models/graph_diff.dart';
+import '../models/node.dart';
 import '../models/target_diagnosis.dart';
 import 'graph_provider.dart';
 import 'ws_provider.dart';
@@ -61,6 +62,8 @@ class TargetDiagnosticsNotifier extends Notifier<TargetDiagnosis> {
     final liveNodes = notifier.nodes.values.where((n) => n.live);
     final nodeCount = liveNodes.length;
     final edgeCount = liveNodes.fold<int>(0, (sum, n) => sum + n.edges.length);
+    final orphanCount =
+        liveNodes.where((n) => n.state == NodeStateDto.orphan).length;
 
     final pastWindow = _firstObservedAt != null &&
         now().difference(_firstObservedAt!) >= kNoEventsWindow;
@@ -74,6 +77,7 @@ class TargetDiagnosticsNotifier extends Notifier<TargetDiagnosis> {
       pastNoEventsWindow: pastWindow,
       targetPid: _targetPid,
       targetName: _targetName,
+      orphanCount: orphanCount,
     );
   }
 }

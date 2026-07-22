@@ -21,6 +21,13 @@ enum TargetStatus {
   /// inferred: effective-site names are predominantly hex/`0x…` fallbacks,
   /// i.e. the target itself is unsymbolized.
   unsymbolized,
+
+  /// Same low edge/node ratio as [noEdges], but explained by a different,
+  /// benign cause: symbols are resolving fine, and most live nodes have
+  /// simply become orphaned (their owner freed) — an orphan has no owning
+  /// edge by definition, so a graph that's mostly orphans naturally has a
+  /// near-zero edge ratio even though phi built topology correctly.
+  noEdgesOrphaned,
 }
 
 /// Minimum wall-clock time after we start observing a session before "zero
@@ -42,6 +49,11 @@ const double kNoEdgesRatioThreshold = 0.05;
 /// Above this hex-fallback/total-symbol ratio, effective-site names are
 /// considered "predominantly" unresolved.
 const double kUnsymbolizedRatioThreshold = 0.8;
+
+/// Above this orphan/node ratio, a low edge ratio is considered explained
+/// by orphaning rather than by a symbol/topology problem: most of the
+/// graph has lost its owner, so of course there are few owning edges left.
+const double kOrphanExplainsNoEdgesRatioThreshold = 0.5;
 
 /// The current target-health diagnosis, plus the raw counts it was derived
 /// from (for the banner's hover tooltip / the debug overlay — dual-level
@@ -93,6 +105,9 @@ class TargetDiagnosis {
     required bool pastNoEventsWindow,
     required int? targetPid,
     required String? targetName,
+    // Defaults to 0 (never explains a low edge ratio) so existing callers
+    // that don't yet track orphan count keep their original classification.
+    int orphanCount = 0,
   }) {
     if (eventsReceived == 0) {
       if (!pastNoEventsWindow) {
@@ -126,8 +141,25 @@ class TargetDiagnosis {
     final totalSymbols = symbolsResolved + hexFallback;
     final hexRatio = totalSymbols == 0 ? 0.0 : hexFallback / totalSymbols;
     final unsymbolized = totalSymbols > 0 && hexRatio >= kUnsymbolizedRatioThreshold;
+    final orphanRatio = nodeCount == 0 ? 0.0 : orphanCount / nodeCount;
+    final orphanExplainsNoEdges =
+        !unsymbolized && orphanRatio >= kOrphanExplainsNoEdgesRatioThreshold;
 
     if (nodeCount > 0 && edgeRatio < kNoEdgesRatioThreshold) {
+      if (orphanExplainsNoEdges) {
+        return TargetDiagnosis(
+          status: TargetStatus.noEdgesOrphaned,
+          message: 'No live ownership edges — $orphanCount of $nodeCount '
+              'allocations are currently orphaned (leaked). Symbols are '
+              'resolving normally. Allocation sizes and growth are still '
+              'available in the Map view.',
+          eventsReceived: eventsReceived,
+          symbolsResolved: symbolsResolved,
+          hexFallback: hexFallback,
+          nodeCount: nodeCount,
+          edgeCount: edgeCount,
+        );
+      }
       const base = 'Capturing allocations, but no ownership structure could '
           'be inferred — this target lacks the debug symbols HeapLens needs '
           'to build topology. Allocation sizes and growth are still '

@@ -11,7 +11,9 @@ import 'package:heaplens_flutter/providers/graph_provider.dart';
 import 'package:heaplens_flutter/providers/selection_provider.dart';
 import 'package:heaplens_flutter/providers/ws_provider.dart';
 import 'package:heaplens_flutter/simulation/force_layout.dart';
+import 'package:heaplens_flutter/theme/xynorash_theme.dart';
 import 'package:heaplens_flutter/widgets/graph_canvas.dart';
+import 'package:heaplens_flutter/widgets/node_colors.dart';
 
 NodeDto _node({
   required int id,
@@ -385,5 +387,77 @@ void main() {
         .applyDiff(GraphSnapshot(ts: 1, nodes: [node]));
     await tester.pump();
     expect(find.byKey(const Key('graphCanvasPaint')), paints..circle());
+  });
+
+  testWidgets(
+      'regression: a selected orphan node keeps its state-derived coral '
+      'fill and additionally gets the selection ring — selection must never '
+      'override the state color', (tester) async {
+    final controller = StreamController<GraphMessage>();
+    addTearDown(() => controller.close());
+
+    final layout = ForceLayout(centerX: 200, centerY: 200, random: Random(8));
+    final node = _node(id: 5, state: NodeStateDto.orphan);
+    layout.addNode(node, {5: node});
+    layout.simNodes[5]!.position.setValues(150, 150);
+    layout.simNodes[5]!.radius = 20;
+
+    late ProviderContainer container;
+    await tester.pumpWidget(
+      ProviderScope(
+        overrides: [
+          graphMessageProvider.overrideWith((ref) => controller.stream),
+        ],
+        child: Consumer(
+          builder: (context, ref, _) {
+            container = ProviderScope.containerOf(context);
+            return MaterialApp(
+              home: Scaffold(
+                body: SizedBox(
+                  width: 400,
+                  height: 400,
+                  child: GraphCanvas(layout: layout),
+                ),
+              ),
+            );
+          },
+        ),
+      ),
+    );
+
+    container
+        .read(graphProvider.notifier)
+        .applyDiff(GraphSnapshot(ts: 1, nodes: [node]));
+    await tester.pump();
+
+    await tester.tapAt(const Offset(150, 150));
+    await tester.pump();
+    expect(container.read(selectedNodeIdProvider), 5);
+
+    // Paint order (graph_canvas.dart's `_paintNodes`): glow, base fill,
+    // orphan pulsing ring, selection glow, selection ring — `paints`
+    // matches each chained `.circle()` against the *next* drawCircle call,
+    // so the base fill's position in that sequence (2nd) must be
+    // accounted for rather than matched as "any circle".
+    //
+    // The base fill color must still be the state color (coral for
+    // orphan), not overridden by selection...
+    expect(
+      find.byKey(const Key('graphCanvasPaint')),
+      paints
+        ..circle() // glow
+        ..circle(color: kNodeStateColors[NodeStateDto.orphan]), // base fill
+    );
+    // ...and the cyan selection ring must additionally be present further
+    // along in the same paint sequence (additive, not a replacement).
+    expect(
+      find.byKey(const Key('graphCanvasPaint')),
+      paints
+        ..circle() // glow
+        ..circle() // base fill
+        ..circle() // orphan pulsing ring
+        ..circle() // selection glow (cyan, alpha 0.5)
+        ..circle(color: XynorashTheme.cyan), // selection ring (cyan, alpha 1.0)
+    );
   });
 }

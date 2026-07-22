@@ -82,6 +82,59 @@ void main() {
       expect(d.message, isNot(contains('Symbols unavailable for this target.')));
     });
 
+    test('events flowing, nodes present, near-zero edges, symbols fully resolved, '
+        'most nodes orphaned: noEdgesOrphaned, not the symbol-envelope message', () {
+      final d = TargetDiagnosis.classify(
+        eventsReceived: 340226,
+        symbolsResolved: 111,
+        hexFallback: 0,
+        nodeCount: 111,
+        edgeCount: 0,
+        pastNoEventsWindow: true,
+        targetPid: 7048,
+        targetName: 'checkout_service',
+        orphanCount: 111,
+      );
+      expect(d.status, TargetStatus.noEdgesOrphaned);
+      expect(d.message, isNot(contains('lacks the debug symbols')));
+      expect(d.message, contains('111 of 111 allocations are currently orphaned'));
+      expect(d.message, contains('Symbols are resolving normally'));
+    });
+
+    test('near-zero edges with symbols fully resolved but orphan ratio below '
+        'threshold: falls back to the original noEdges message, cause unclear', () {
+      final d = TargetDiagnosis.classify(
+        eventsReceived: 500,
+        symbolsResolved: 90,
+        hexFallback: 2,
+        nodeCount: 100,
+        edgeCount: 1,
+        pastNoEventsWindow: true,
+        targetPid: 1,
+        targetName: 'flat.exe',
+        orphanCount: 10, // 10% — below kOrphanExplainsNoEdgesRatioThreshold
+      );
+      expect(d.status, TargetStatus.noEdges);
+      expect(d.message, contains('lacks the debug symbols'));
+    });
+
+    test('high orphan ratio does not override a genuinely unsymbolized target: '
+        'unsymbolized still wins', () {
+      final d = TargetDiagnosis.classify(
+        eventsReceived: 500,
+        symbolsResolved: 2,
+        hexFallback: 98,
+        nodeCount: 100,
+        edgeCount: 0,
+        pastNoEventsWindow: true,
+        targetPid: 1,
+        targetName: 'stripped.exe',
+        orphanCount: 90,
+      );
+      expect(d.status, TargetStatus.unsymbolized);
+      expect(d.message, contains('Symbols unavailable for this target.'));
+    });
+
     test('events flowing, nodes present, near-zero edges, symbols predominantly hex: unsymbolized', () {
       final d = TargetDiagnosis.classify(
         eventsReceived: 500,
