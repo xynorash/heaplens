@@ -40,6 +40,17 @@ impl Resolver {
     pub fn is_machinery(&self, addr: u64) -> bool {
         self.map.get(&addr).map(|(_, m)| *m).unwrap_or(true)
     }
+
+    /// Whether a SYMBOLS frame has arrived for `addr` at all — distinct from
+    /// `is_machinery`, which treats "unknown" and "known machinery" the same
+    /// way (both skip). Callers that need to tell "genuinely, permanently
+    /// machinery" apart from "not resolved yet, could turn out to be real
+    /// code" — e.g. `graph::classify_effective_site`, deciding whether a
+    /// node's φ candidacy is stable or still provisional — need this
+    /// distinction; `is_machinery` alone cannot provide it.
+    pub fn is_known(&self, addr: u64) -> bool {
+        self.map.contains_key(&addr)
+    }
 }
 
 #[cfg(test)]

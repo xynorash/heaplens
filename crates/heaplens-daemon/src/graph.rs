@@ -27,6 +27,47 @@ pub struct Node {
     /// timing or outcome. Exists so H1 (detection-latency measurement) has a
     /// real owner-free timestamp to measure from instead of inferring one.
     pub owner_free_ts: Option<u64>,
+    /// This node's own classification in `site_index`/`pending_site_ids`
+    /// (2026-07-22 processing-ceiling fix) — computed once at insertion by
+    /// `classify_effective_site` and otherwise stable (see `SiteClass`'s doc
+    /// comment). Stored on the node so eviction (`drain_diff`) knows which
+    /// index bucket to clean up without recomputing anything.
+    pub site_class: SiteClass,
+}
+
+/// A node's own effective-site classification for `OwnershipGraph::site_index`
+/// / `pending_site_ids` — a stability-aware variant of what
+/// `OwnershipGraph::effective_site_name` computes fresh on every call.
+///
+/// `effective_site_index`'s skip rule treats "unknown to the resolver" and
+/// "known machinery" identically (both get skipped past) — which is correct
+/// for a fresh, uncached recomputation, but wrong to bake into a persistent
+/// index: an address that's merely *unresolved* today could resolve to real,
+/// non-machinery code tomorrow, which would change — possibly to an *earlier*
+/// stack position than whatever this scan currently lands on — the node's
+/// true effective site. Indexing that node under today's (possibly
+/// premature) answer would silently miss it as a future φ candidate once
+/// resolution catches up. `SiteClass` exists to tell "this answer can never
+/// change" (`Resolved`/`NoSite`, both built entirely from addresses the
+/// resolver already has a definite answer for) apart from "this answer is
+/// provisional" (`Pending`, hit an address the resolver hasn't seen yet) —
+/// only `Pending` nodes need re-checking, in `infer_ownership`, as new
+/// symbols arrive.
+#[derive(Clone, Debug, PartialEq)]
+pub enum SiteClass {
+    /// A real (non-machinery) effective site was found, and nothing skipped
+    /// on the way to it was merely unresolved — this name is final.
+    Resolved(String),
+    /// Every address considered (up to `stack_len`) is either `0` or known
+    /// machinery — this node structurally has no effective site, and that
+    /// can never change (mirrors `effective_site_index` returning `None`
+    /// when every address is *definitively* classified).
+    NoSite,
+    /// At least one address considered before a `Resolved`/`NoSite`
+    /// conclusion could be reached is still unknown to the resolver. Not
+    /// safe to index anywhere permanent yet — re-classified opportunistically
+    /// in `infer_ownership` until it resolves one way or the other.
+    Pending,
 }
 
 pub struct OwnershipGraph {
@@ -41,6 +82,41 @@ pub struct OwnershipGraph {
     removed: Vec<u64>,
     /// Rolling max of ev.ts_nanos across all received events. Used as Diff.ts.
     pub max_ts_seen: u64,
+    /// owner id → ids of its live children (2026-07-22 processing-ceiling
+    /// fix) — the reverse of `Node.owner`, letting `on_dealloc` find a dying
+    /// node's children in O(children) instead of scanning every node in the
+    /// graph. Maintained wherever `.owner` is written: populated in
+    /// `on_alloc` alongside `edges_out.push`; both the key (the whole
+    /// bucket, since every child of a dying node is about to be orphaned
+    /// anyway) and the dying node's own membership as a value under its
+    /// *own* owner's bucket are removed in `on_dealloc`, in the same place
+    /// `edges_out` gets the identical mutation. Never deferred to eviction —
+    /// unlike `site_index` below, `on_dealloc` already visits every place
+    /// this index could still reference a dying node, so nothing is left
+    /// dangling by the time eviction runs.
+    owner_index: HashMap<u64, Vec<u64>>,
+    /// Node ids grouped by their own *stable* effective-site name (see
+    /// `SiteClass`) — lets `infer_ownership` look up "which live nodes could
+    /// match name X" in O(candidates for X) instead of scanning every node
+    /// in the graph and recomputing its effective site on every single
+    /// allocation. Populated in `on_alloc`, promoted into from
+    /// `pending_site_ids` in `infer_ownership` as symbols resolve. A node's
+    /// bucket entry is removed only at the same point `self.nodes` itself
+    /// evicts the node (`drain_diff`) — deferred, not immediate, exactly
+    /// mirroring `self.nodes`'s own deferred-to-eviction cleanup: a
+    /// dead-but-not-yet-evicted node must remain a *filterable* (via
+    /// `n.live`) candidate here, not a vanished one, for the same reason
+    /// `self.nodes` itself keeps it around that long.
+    site_index: HashMap<String, Vec<u64>>,
+    /// Node ids whose own effective-site classification is still provisional
+    /// (`SiteClass::Pending`) — re-checked on every `infer_ownership` call
+    /// and promoted into `site_index` (or dropped as permanently `NoSite`)
+    /// the moment the resolver catches up. In real traffic this stays empty
+    /// almost all the time (the writer resolves every address a batch's
+    /// events reference before sending that batch), so the re-check cost is
+    /// negligible; it exists for correctness in the general case, not as an
+    /// optimization. Cleaned up at the same eviction point as `site_index`.
+    pending_site_ids: HashSet<u64>,
 }
 
 impl Default for OwnershipGraph {
@@ -59,6 +135,9 @@ impl OwnershipGraph {
             updated: HashSet::new(),
             removed: Vec::new(),
             max_ts_seen: 0,
+            owner_index: HashMap::new(),
+            site_index: HashMap::new(),
+            pending_site_ids: HashSet::new(),
         }
     }
 
@@ -68,6 +147,7 @@ impl OwnershipGraph {
         self.next_id += 1;
 
         let owner_id = self.infer_ownership(&ev.stack, ev.stack_len, resolver);
+        let site_class = Self::classify_effective_site(&ev.stack, ev.stack_len, resolver);
 
         let node = Node {
             id,
@@ -82,6 +162,7 @@ impl OwnershipGraph {
             had_owner_once: owner_id.is_some(),
             state: NodeState::Healthy,
             owner_free_ts: None,
+            site_class: site_class.clone(),
         };
 
         // Register as a child of the owner.
@@ -90,6 +171,21 @@ impl OwnershipGraph {
                 owner.edges_out.push(id);
                 self.updated.insert(oid);
             }
+            self.owner_index.entry(oid).or_default().push(id);
+        }
+
+        // Index this node's own site so it can be found as a candidate
+        // owner for future allocations — mirrors exactly what the old
+        // full-scan would have found by recomputing `effective_site_name`
+        // for this node on every later `infer_ownership` call.
+        match site_class {
+            SiteClass::Resolved(name) => {
+                self.site_index.entry(name).or_default().push(id);
+            }
+            SiteClass::Pending => {
+                self.pending_site_ids.insert(id);
+            }
+            SiteClass::NoSite => {}
         }
 
         self.nodes.insert(id, node);
@@ -105,13 +201,13 @@ impl OwnershipGraph {
 
         self.removed.push(id);
 
-        // Collect children to orphan — avoid borrow issues by collecting ids first.
-        let children: Vec<u64> = self
-            .nodes
-            .values()
-            .filter(|n| n.live && n.owner == Some(id))
-            .map(|n| n.id)
-            .collect();
+        // Collect (and clear) this node's children via the owner index —
+        // replaces the old full self.nodes.values() scan. Removing the
+        // whole bucket here is correct, not just convenient: every child
+        // found is about to have its own `owner` cleared below, so none of
+        // them belongs under this key (or any key) in the index afterward
+        // regardless — no per-child list surgery needed.
+        let children: Vec<u64> = self.owner_index.remove(&id).unwrap_or_default();
 
         for cid in children {
             if let Some(child) = self.nodes.get_mut(&cid) {
@@ -124,12 +220,16 @@ impl OwnershipGraph {
             self.updated.insert(cid);
         }
 
-        // Remove this node from its owner's edges_out list.
+        // Remove this node from its owner's edges_out list and owner-index
+        // bucket alike — same mutation, same moment, for the same reason.
         let owner_id = self.nodes.get(&id).and_then(|n| n.owner);
         if let Some(oid) = owner_id {
             if let Some(owner) = self.nodes.get_mut(&oid) {
                 owner.edges_out.retain(|&e| e != id);
                 self.updated.insert(oid);
+            }
+            if let Some(v) = self.owner_index.get_mut(&oid) {
+                v.retain(|&e| e != id);
             }
         }
 
@@ -225,7 +325,35 @@ impl OwnershipGraph {
         // silently start relying on that read. Evicting here keeps a node
         // visible in `self.nodes` for the exact duration current diff/sweep
         // logic can observe it, and gone the instant that window closes.
+        //
+        // `site_index`/`pending_site_ids` (2026-07-22 processing-ceiling
+        // fix) get the *same* deferred-to-eviction treatment, right here,
+        // for the identical reason `self.nodes` itself does: a node that
+        // died this tick must still be a findable (via `n.live`-filtered)
+        // candidate for anything that looked it up between `on_dealloc` and
+        // this point, so its index entry cannot vanish any sooner than
+        // `self.nodes`'s own entry does. `owner_index` is deliberately NOT
+        // touched here — `on_dealloc` already fully cleans a dying node out
+        // of it immediately (see `on_dealloc`'s doc comment), so by the time
+        // an id reaches `self.removed`, `owner_index` holds no reference to
+        // it in either direction; touching it again here would be a no-op.
         for id in self.removed.drain(..) {
+            if let Some(node) = self.nodes.get(&id) {
+                match &node.site_class {
+                    SiteClass::Resolved(name) => {
+                        if let Some(v) = self.site_index.get_mut(name) {
+                            v.retain(|&x| x != id);
+                            if v.is_empty() {
+                                self.site_index.remove(name);
+                            }
+                        }
+                    }
+                    SiteClass::Pending => {
+                        self.pending_site_ids.remove(&id);
+                    }
+                    SiteClass::NoSite => {}
+                }
+            }
             self.nodes.remove(&id);
         }
 
@@ -271,9 +399,39 @@ impl OwnershipGraph {
     /// the allocation. Unknown/unresolved addresses have no name and cannot
     /// match anything, which is intentional: an address can't be
     /// misattributed to a function nobody has heard of yet.
+    ///
+    /// 2026-07-22: no longer called from production code (`infer_ownership`
+    /// now goes through `classify_effective_site`/`site_index` instead) —
+    /// kept for `owner_effective_site_name_matches_the_name_a_childs_search_set_looks_for`,
+    /// which pins down that a `Resolved` classification's name is exactly
+    /// what this function would independently compute for the same stack.
+    #[allow(dead_code)]
     fn effective_site_name(stack: &[u64; 16], stack_len: u8, resolver: &Resolver) -> Option<String> {
         let idx = Self::effective_site_index(stack, stack_len, resolver)?;
         Some(resolver.name_for(stack[idx]))
+    }
+
+    /// Stability-aware sibling of `effective_site_name` — see `SiteClass`'s
+    /// doc comment for why the two must differ. Same skip rule as
+    /// `effective_site_index` (`addr != 0 && !is_machinery(addr)`), but
+    /// additionally distinguishes an address that's *definitively* known
+    /// machinery from one that's merely unresolved so far.
+    fn classify_effective_site(stack: &[u64; 16], stack_len: u8, resolver: &Resolver) -> SiteClass {
+        for i in 0..stack_len as usize {
+            let addr = stack[i];
+            if addr == 0 {
+                continue;
+            }
+            if !resolver.is_known(addr) {
+                return SiteClass::Pending;
+            }
+            if !resolver.is_machinery(addr) {
+                return SiteClass::Resolved(resolver.name_for(addr));
+            }
+            // Known machinery — keep scanning past it, same as
+            // `effective_site_index`.
+        }
+        SiteClass::NoSite
     }
 
     /// φ: find the live node whose effective site *function* appears at
@@ -284,7 +442,17 @@ impl OwnershipGraph {
     /// own excluded site) while still matching a genuine owner further up
     /// the stack. Among candidates, prefer greatest `ts`; tie-break by
     /// greatest `id`.
-    fn infer_ownership(&self, new_stack: &[u64; 16], stack_len: u8, resolver: &Resolver) -> Option<u64> {
+    ///
+    /// 2026-07-22 processing-ceiling fix: this used to scan every node in
+    /// `self.nodes` on every call (O(N) per allocation, confirmed via
+    /// profiling to be ~50% of all graph-task time under sustained load —
+    /// see the fix's commit for the measurement). Candidates now come from
+    /// `site_index`, narrowed to exactly the names in `search_set`, plus a
+    /// `pending_site_ids` re-check that keeps the index correct as symbols
+    /// resolve (see `SiteClass`). The tie-break (`max` over `(ts, id)`) is
+    /// unchanged — same key, just applied to a pre-narrowed candidate set
+    /// instead of the whole map.
+    fn infer_ownership(&mut self, new_stack: &[u64; 16], stack_len: u8, resolver: &Resolver) -> Option<u64> {
         let len = stack_len as usize;
         let own_idx = match Self::effective_site_index(new_stack, stack_len, resolver) {
             Some(i) => i,
@@ -298,15 +466,57 @@ impl OwnershipGraph {
             .map(|a| resolver.name_for(a))
             .collect();
 
-        self.nodes
-            .values()
-            .filter(|n| {
-                n.live
-                    && Self::effective_site_name(&n.stack, n.stack_len, resolver)
-                        .is_some_and(|name| search_set.contains(&name))
-            })
-            .max_by_key(|n| (n.ts, n.id))
-            .map(|n| n.id)
+        if search_set.is_empty() {
+            return None;
+        }
+
+        // Self-healing: promote/demote every still-`Pending` node using the
+        // current resolver state, before consulting the index below. In
+        // real traffic this loop is over an empty (or near-empty) set — see
+        // `pending_site_ids`'s doc comment — so this is not reintroducing
+        // the O(N) cost being fixed; it exists so a genuinely-late symbol
+        // (the scenario `effective_site_name`'s "recomputed fresh" doc
+        // comment already guarantees) still gets found on the very next
+        // call, matching pre-fix behavior exactly rather than approximating it.
+        let pending_ids: Vec<u64> = self.pending_site_ids.iter().copied().collect();
+        for pid in pending_ids {
+            let reclass = match self.nodes.get(&pid) {
+                Some(node) => Self::classify_effective_site(&node.stack, node.stack_len, resolver),
+                None => continue, // defensive: shouldn't happen, pending ids are evicted alongside self.nodes
+            };
+            match reclass {
+                SiteClass::Pending => {} // still unresolved, leave as-is
+                SiteClass::Resolved(name) => {
+                    self.pending_site_ids.remove(&pid);
+                    self.site_index.entry(name.clone()).or_default().push(pid);
+                    if let Some(node) = self.nodes.get_mut(&pid) {
+                        node.site_class = SiteClass::Resolved(name);
+                    }
+                }
+                SiteClass::NoSite => {
+                    self.pending_site_ids.remove(&pid);
+                    if let Some(node) = self.nodes.get_mut(&pid) {
+                        node.site_class = SiteClass::NoSite;
+                    }
+                }
+            }
+        }
+
+        let mut best: Option<(u64, u64)> = None; // (ts, id) — same tie-break key as the old max_by_key
+        for name in &search_set {
+            let Some(ids) = self.site_index.get(name) else { continue };
+            for &cid in ids {
+                let Some(node) = self.nodes.get(&cid) else { continue };
+                if !node.live {
+                    continue;
+                }
+                let key = (node.ts, node.id);
+                if best.map_or(true, |b| key > b) {
+                    best = Some(key);
+                }
+            }
+        }
+        best.map(|(_, id)| id)
     }
 
     pub fn node_by_ptr(&self, ptr: u64) -> Option<&Node> {
@@ -488,5 +698,160 @@ mod invariant_tests {
             "the owner's effective site name must appear in the child's search set — \
              got owner_name={owner_name:?}, child_search_set={child_search_set:?}"
         );
+    }
+}
+
+// 2026-07-22 processing-ceiling fix: proves `site_index`/`owner_index`
+// never diverge from what a full scan would find, across the exact
+// lifecycle the eviction question is about — alloc, ownership assignment,
+// reorphaning on dealloc, and eviction at drain_diff — plus late symbol
+// resolution, the one case the index design has to actively defend against
+// (see `SiteClass`'s doc comment). This is the test that would have failed
+// immediately had the site index not been cleaned up at the eviction point.
+#[cfg(test)]
+mod index_consistency_tests {
+    use super::*;
+
+    fn make_ev(ptr: u64, ts: u64, stack: &[u64]) -> AllocEvent {
+        let mut s = [0u64; 16];
+        let len = stack.len().min(16);
+        s[..len].copy_from_slice(&stack[..len]);
+        AllocEvent::new(EventKind::Alloc, ptr, 0, 32, 8, ts, s, len as u8)
+    }
+
+    /// Byte-for-byte replica of the pre-fix `infer_ownership` — scans every
+    /// node directly rather than consulting `site_index`/`pending_site_ids`.
+    /// Exists only to prove the indexed implementation returns the exact
+    /// same answer; if this and `infer_ownership` ever diverge, that is
+    /// precisely the "index says something different from a full scan" bug
+    /// this test module exists to catch.
+    fn brute_force_infer_ownership(
+        nodes: &HashMap<u64, Node>,
+        new_stack: &[u64; 16],
+        stack_len: u8,
+        resolver: &Resolver,
+    ) -> Option<u64> {
+        let len = stack_len as usize;
+        let own_idx = OwnershipGraph::effective_site_index(new_stack, stack_len, resolver)?;
+        let search_set: HashSet<String> = new_stack[own_idx + 1..len]
+            .iter()
+            .copied()
+            .filter(|&a| a != 0 && !resolver.is_machinery(a))
+            .map(|a| resolver.name_for(a))
+            .collect();
+        nodes
+            .values()
+            .filter(|n| {
+                n.live
+                    && OwnershipGraph::effective_site_name(&n.stack, n.stack_len, resolver)
+                        .is_some_and(|name| search_set.contains(&name))
+            })
+            .max_by_key(|n| (n.ts, n.id))
+            .map(|n| n.id)
+    }
+
+    /// Asserts the indexed `infer_ownership` agrees with a brute-force full
+    /// scan for a hypothetical new allocation with `probe_stack`, without
+    /// actually creating that allocation — so the same graph state can be
+    /// probed repeatedly at different points in a scenario.
+    fn assert_index_matches_brute_force(
+        g: &mut OwnershipGraph,
+        probe_stack: &[u64; 16],
+        probe_len: u8,
+        r: &Resolver,
+    ) {
+        let brute = brute_force_infer_ownership(&g.nodes, probe_stack, probe_len, r);
+        let indexed = g.infer_ownership(probe_stack, probe_len, r);
+        assert_eq!(
+            indexed, brute,
+            "indexed infer_ownership diverged from a brute-force full scan for probe_stack={probe_stack:?}"
+        );
+    }
+
+    #[test]
+    fn index_matches_brute_force_across_alloc_dealloc_eviction_and_late_resolution() {
+        let owner_site = 0xAAAA;
+        let leaf_site = 0xBBBB;
+        let late_site = 0xCCCC; // deliberately left unresolved at first alloc
+
+        let mut r = Resolver::new();
+        r.insert(owner_site, "owner_fn".to_owned(), false);
+        r.insert(leaf_site, "leaf_fn".to_owned(), false);
+        // late_site intentionally NOT inserted yet.
+
+        let mut g = OwnershipGraph::new();
+        let probe_owner_leaf = || {
+            let mut s = [0u64; 16];
+            s[0] = leaf_site;
+            s[1] = owner_site;
+            s
+        };
+
+        // Step 1: a plain owner node, and a child owned by it — sanity
+        // baseline before anything interesting (pending/eviction) happens.
+        g.on_alloc(&make_ev(0x1000, 100, &[owner_site]), &r);
+        g.on_alloc(&make_ev(0x2000, 200, &[leaf_site, owner_site]), &r);
+        assert_index_matches_brute_force(&mut g, &probe_owner_leaf(), 2, &r);
+
+        // Step 2: a node whose own stack references `late_site`, unresolved
+        // at creation — must land in `pending_site_ids`, not `site_index`.
+        g.on_alloc(&make_ev(0x3000, 300, &[late_site]), &r);
+        let pending_id = g.node_by_ptr(0x3000).unwrap().id;
+        assert!(
+            g.pending_site_ids.contains(&pending_id),
+            "unresolved-address node must be pending, not indexed"
+        );
+        assert!(matches!(g.nodes.get(&pending_id).unwrap().site_class, SiteClass::Pending));
+
+        // A probe for a hypothetical child of late_site must agree with
+        // brute force (both find nothing — late_site isn't resolved yet).
+        let mut probe_late = [0u64; 16];
+        probe_late[0] = leaf_site;
+        probe_late[1] = late_site;
+        assert_index_matches_brute_force(&mut g, &probe_late, 2, &r);
+
+        // Step 3: late_site resolves. The next `on_alloc` (exactly like
+        // production, symbols always arriving via a real event) must
+        // promote the pending node into `site_index` and find it as the
+        // owner — the scenario `effective_site_name`'s "recomputed fresh"
+        // guarantee exists for, now proven for the indexed path too.
+        r.insert(late_site, "late_fn".to_owned(), false);
+        g.on_alloc(&make_ev(0x4000, 400, &probe_late), &r);
+        let late_child = g.node_by_ptr(0x4000).unwrap();
+        assert_eq!(
+            late_child.owner,
+            Some(pending_id),
+            "late-resolved node must be found as owner once its symbol arrives"
+        );
+        assert!(
+            !g.pending_site_ids.contains(&pending_id),
+            "promoted node must leave pending_site_ids"
+        );
+        assert!(matches!(
+            &g.nodes.get(&pending_id).unwrap().site_class,
+            SiteClass::Resolved(n) if n == "late_fn"
+        ));
+
+        // Step 4: dealloc the original owner — reorphans its child
+        // immediately, and its owner_index bucket must be gone immediately
+        // too (not deferred to eviction, per on_dealloc's contract).
+        let owner_id = g.node_by_ptr(0x1000).unwrap().id;
+        g.on_dealloc(0x1000, 500);
+        assert!(
+            !g.owner_index.contains_key(&owner_id),
+            "owner_index bucket must be cleared immediately on dealloc, not deferred"
+        );
+        assert_index_matches_brute_force(&mut g, &probe_owner_leaf(), 2, &r);
+
+        // Step 5: drain_diff evicts the dead owner. site_index must hold no
+        // reference to it afterward — the exact bug this test would have
+        // caught immediately had eviction cleanup been missing.
+        let _ = g.drain_diff(&r);
+        assert!(
+            g.site_index.values().all(|ids| !ids.contains(&owner_id)),
+            "evicted node must not remain in site_index under any name"
+        );
+        assert!(!g.nodes.contains_key(&owner_id), "evicted node must be gone from self.nodes");
+        assert_index_matches_brute_force(&mut g, &probe_owner_leaf(), 2, &r);
     }
 }

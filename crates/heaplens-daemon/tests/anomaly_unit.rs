@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use heaplens_daemon::anomaly::{sweep, StormTracker};
 use heaplens_daemon::config::Config;
-use heaplens_daemon::graph::Node;
+use heaplens_daemon::graph::{Node, SiteClass};
 use heaplens_protocol::NodeState;
 
 // ---------------------------------------------------------------------------
@@ -43,6 +43,9 @@ fn make_node(
         had_owner_once,
         state: NodeState::Healthy,
         owner_free_ts: None,
+        // anomaly::sweep never reads site_class — irrelevant to what these
+        // tests exercise, so an arbitrary stable value is fine.
+        site_class: SiteClass::NoSite,
     }
 }
 
