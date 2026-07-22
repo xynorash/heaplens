@@ -107,7 +107,20 @@ pub struct OwnershipGraph {
     /// dead-but-not-yet-evicted node must remain a *filterable* (via
     /// `n.live`) candidate here, not a vanished one, for the same reason
     /// `self.nodes` itself keeps it around that long.
-    site_index: HashMap<String, Vec<u64>>,
+    ///
+    /// `HashSet`, not `Vec` (2026-07-22 drain_diff-cost fix): a workload with
+    /// only a handful of distinct real call sites (this project's own
+    /// synthetic injection targets among them) puts a very large number of
+    /// nodes under the same one or two names — confirmed via profiling that
+    /// removing a single dying node from a popular bucket via `Vec::retain`
+    /// (O(bucket size)) was ~63-65% of *all* graph-task wall time under
+    /// sustained load, dwarfing the diff-construction work eviction was
+    /// supposed to be a small tail of. `HashSet::remove` is O(1) average;
+    /// iteration for `infer_ownership`'s candidate scan is unaffected (same
+    /// `for &cid in ids` shape either type supports), and set semantics are
+    /// exactly what this was always logically storing — a node's id can only
+    /// ever appear once under its one stable name.
+    site_index: HashMap<String, HashSet<u64>>,
     /// Node ids whose own effective-site classification is still provisional
     /// (`SiteClass::Pending`) — re-checked on every `infer_ownership` call
     /// and promoted into `site_index` (or dropped as permanently `NoSite`)
@@ -180,7 +193,7 @@ impl OwnershipGraph {
         // for this node on every later `infer_ownership` call.
         match site_class {
             SiteClass::Resolved(name) => {
-                self.site_index.entry(name).or_default().push(id);
+                self.site_index.entry(name).or_default().insert(id);
             }
             SiteClass::Pending => {
                 self.pending_site_ids.insert(id);
@@ -342,7 +355,7 @@ impl OwnershipGraph {
                 match &node.site_class {
                     SiteClass::Resolved(name) => {
                         if let Some(v) = self.site_index.get_mut(name) {
-                            v.retain(|&x| x != id);
+                            v.remove(&id);
                             if v.is_empty() {
                                 self.site_index.remove(name);
                             }
@@ -488,7 +501,7 @@ impl OwnershipGraph {
                 SiteClass::Pending => {} // still unresolved, leave as-is
                 SiteClass::Resolved(name) => {
                     self.pending_site_ids.remove(&pid);
-                    self.site_index.entry(name.clone()).or_default().push(pid);
+                    self.site_index.entry(name.clone()).or_default().insert(pid);
                     if let Some(node) = self.nodes.get_mut(&pid) {
                         node.site_class = SiteClass::Resolved(name);
                     }
