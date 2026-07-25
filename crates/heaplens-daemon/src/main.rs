@@ -8,7 +8,10 @@ use heaplens_daemon::{
     config::Config,
     graph::OwnershipGraph,
     ingest, injector,
-    msg::{is_current_target_exit, ConnectRequest, GraphMsg, OrphanEventRecord, StoreMsg, TargetCmd},
+    msg::{
+        is_current_target_exit, should_reset_on_attach, ConnectRequest, GraphMsg,
+        OrphanEventRecord, StoreMsg, TargetCmd,
+    },
     procs,
     resolver::Resolver,
     server,
@@ -269,19 +272,28 @@ async fn main() -> anyhow::Result<()> {
                             }
                         }
 
-                        // Clear graph state before attaching — a new
-                        // process is a new address space; merging
-                        // topologies across processes is nonsensical.
-                        // Broadcast the empty state immediately: diffs only
-                        // carry changes, so without this, already-connected
-                        // clients would keep showing the old target's stale
-                        // nodes until the new target's own first diff.
-                        graph = OwnershipGraph::new();
-                        resolver = Resolver::new();
-                        storm_tracker = StormTracker::new();
-                        warned_sites.clear();
-                        let empty = graph.snapshot(&resolver);
-                        let _ = broadcast_tx.send(Arc::new(empty));
+                        // Clear graph state before attaching — but only if
+                        // `pid` isn't the process the daemon is already
+                        // observing (typically via its own cooperative
+                        // pipe connection). Attaching to an *already-known*
+                        // pid is adding injection on top of the same
+                        // address space, not switching to a new one — see
+                        // `should_reset_on_attach`'s doc comment for why
+                        // resetting in that case silently and permanently
+                        // breaks symbol resolution for the rest of the
+                        // session. Broadcast the empty state immediately on
+                        // a genuine reset: diffs only carry changes, so
+                        // without this, already-connected clients would keep
+                        // showing the old target's stale nodes until the new
+                        // target's own first diff.
+                        if should_reset_on_attach(target_pid, pid) {
+                            graph = OwnershipGraph::new();
+                            resolver = Resolver::new();
+                            storm_tracker = StormTracker::new();
+                            warned_sites.clear();
+                            let empty = graph.snapshot(&resolver);
+                            let _ = broadcast_tx.send(Arc::new(empty));
+                        }
 
                         match injector::attach(pid).await {
                             Ok(()) => {

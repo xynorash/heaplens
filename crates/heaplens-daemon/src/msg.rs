@@ -59,6 +59,58 @@ pub fn is_current_target_exit(attached_pid: Option<u32>, disconnected_pid: u64) 
     attached_pid.map(u64::from) == Some(disconnected_pid)
 }
 
+/// Whether a `TargetCmd::Attach { pid, .. }` should clear graph/resolver
+/// state before injecting.
+///
+/// `current_target_pid` is `target_pid` — the pid the daemon is already
+/// receiving a pipe connection's data for, set by the most recent
+/// `GraphMsg::TargetConnected` (this fires for *both* a cooperative
+/// `#[global_allocator]` producer's own handshake and an injected hook's
+/// handshake; the daemon doesn't distinguish the two). If `pid` matches it,
+/// attaching is adding injection instrumentation to a process the daemon is
+/// *already* observing — the same address space, not a new one — so
+/// resetting would be destructive, not just wasteful: the already-connected
+/// writer's own `symbol_cache` (heaplens-alloc/writer.rs) dedupes SYMBOLS
+/// frames per-connection and has no signal that the daemon just forgot
+/// everything, so it never re-sends addresses it already reported. A target
+/// that reuses a small, fixed set of allocation-site addresses (confirmed
+/// against `checkout_service.exe`) then has those addresses permanently
+/// unresolved daemon-side — no phi edges, no orphan/hot detection, for the
+/// rest of the session, without ever knowing anything is wrong.
+///
+/// Attaching to a genuinely different pid (including the common case of
+/// `current_target_pid` being `None`, no cooperative connection at all)
+/// still resets: that really is a new address space, and merging its
+/// topology with a previous target's would be nonsensical — the comment
+/// this function's caller `graph = OwnershipGraph::new()` line originally
+/// carried alone.
+pub fn should_reset_on_attach(current_target_pid: Option<u64>, pid: u32) -> bool {
+    current_target_pid != Some(pid as u64)
+}
+
+#[cfg(test)]
+mod attach_reset_tests {
+    use super::should_reset_on_attach;
+
+    #[test]
+    fn attaching_to_a_pid_already_being_observed_does_not_reset() {
+        // The exact checkout_service.exe scenario: already cooperatively
+        // connected (target_pid == 4242), then Attach is requested for the
+        // same pid.
+        assert!(!should_reset_on_attach(Some(4242), 4242));
+    }
+
+    #[test]
+    fn attaching_to_a_different_pid_resets() {
+        assert!(should_reset_on_attach(Some(4242), 9999));
+    }
+
+    #[test]
+    fn attaching_with_no_prior_target_resets() {
+        assert!(should_reset_on_attach(None, 9999));
+    }
+}
+
 #[cfg(test)]
 mod target_disconnect_tests {
     use super::is_current_target_exit;
