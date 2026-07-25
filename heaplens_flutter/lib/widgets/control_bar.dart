@@ -398,24 +398,25 @@ class _ConnectionIndicator extends StatelessWidget {
   }
 }
 
-/// Cross-process attachment (2026-07-22): re-enabled after the hook defect
-/// that previously forced this gate off (crash under concurrent
-/// multi-threaded allocation load) was root-caused, fixed, and validated —
-/// TLS/FLS dynamic-loading corruption fixed and proven via self-load and
-/// real cross-process injection; a three-layer memory/performance chain
-/// found and fixed, proven to plateau over a 2h10m real-world soak; a
-/// pre-attach kernel-driver-target detector implemented and validated
-/// against real software. See README.txt for the full evidence trail.
-/// `kAttachEnabled` stays a single flippable gate (not deleted) so a future
-/// regression can disable the entry point the same visible, honest way
-/// this one was — present but disabled with a reason, never silently
-/// removed.
-const bool kAttachEnabled = true;
+/// Cross-process attachment (2026-07-26): disabled again after a second,
+/// distinct confirmed hook defect — separate from the concurrent-allocation
+/// crash fixed and validated on 2026-07-22 (that fix remains correct and in
+/// place; this is not a regression of it). A target process that exits
+/// normally while HeapLens's hooks are still installed (no explicit Detach
+/// first) crashes reliably (STATUS_ACCESS_VIOLATION), 100% reproducing.
+/// Root cause: heaplens-hook has no DLL_PROCESS_DETACH safety handling — the
+/// module is torn down by the OS while its MinHook trampolines, reentrancy
+/// guard, ring buffer, and private-heap state are all still live and hooks
+/// still intercept calls. See README.txt for the full evidence trail.
+/// `kAttachEnabled` stays a single flippable gate (not deleted) so this
+/// regression is disabled the same visible, honest way the prior one was —
+/// present but disabled with a reason, never silently removed.
+const bool kAttachEnabled = false;
 const String kAttachDisabledReason =
-    'Process attachment is temporarily disabled in this build — a confirmed '
-    'hook defect was found during testing (crash under concurrent '
-    'multi-threaded allocation). See README.txt. The cooperative capture '
-    'path used by the bundled example producers is unaffected.';
+    'Process attachment is temporarily disabled — a confirmed crash occurs '
+    'if the attached process exits normally without an explicit Detach '
+    'first. Fix in progress. Cooperative capture (used by all bundled '
+    'example producers) is unaffected.';
 const String kAttachEnabledInfo =
     'Process attachment is enabled. HeapLens automatically refuses '
     'processes with kernel-mode driver components (VPN/anti-cheat/security '

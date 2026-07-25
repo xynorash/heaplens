@@ -224,15 +224,17 @@ void main() {
     // re-enable the button, or water down/drop the explanation, without
     // failing anything — this closes that gap.
     //
-    // Re-scoped 2026-07-22 when kAttachEnabled flipped to true (the hook
-    // defect this gate existed for was root-caused, fixed, and validated —
-    // see README.txt): this now pins the *enabled*-branch behavior instead.
-    // A future re-disable of the gate should update this test back, not
-    // leave it silently asserting the wrong branch.
+    // Re-scoped 2026-07-26 when kAttachEnabled flipped back to false (a
+    // second, distinct confirmed hook defect: a target that exits normally
+    // while hooks are still installed crashes reliably — see README.txt).
+    // This pins the *disabled*-branch behavior. A future re-enable of the
+    // gate should update this test back (see the enabled-branch version
+    // this superseded, in git history at the 2026-07-22 re-enable commit),
+    // not leave it silently asserting the wrong branch.
     testWidgets(
-        'Attach button is genuinely enabled (onPressed is set, not just '
-        'styled) and carries the exact capability/safety-boundary tooltip '
-        'while kAttachEnabled is true', (tester) async {
+        'Attach button is genuinely disabled (onPressed is null, not just '
+        'styled) and carries the exact, specific crash-defect tooltip '
+        'while kAttachEnabled is false', (tester) async {
       final controller = StreamController<GraphMessage>();
       addTearDown(() => controller.close());
       await _pumpControlBar(tester, controller);
@@ -240,31 +242,30 @@ void main() {
       // Pin the real, current gate state this test's assertions depend on —
       // if this ever flips back, the assertions below intentionally stop
       // matching production behavior, which is exactly the point.
-      expect(kAttachEnabled, isTrue,
-          reason: 'this test asserts the *enabled* branch; it must be '
-              'updated (or a companion disabled-state test added) if this '
-              'flag ever flips back to false');
+      expect(kAttachEnabled, isFalse,
+          reason: 'this test asserts the *disabled* branch; it must be '
+              'updated (or a companion enabled-state test added) if this '
+              'flag ever flips back to true');
 
       final button = tester.widget<ElevatedButton>(
         find.byKey(const Key('attachButton')),
       );
       expect(
         button.onPressed,
-        isNotNull,
-        reason: 'must be genuinely enabled (onPressed != null), not just '
-            'visually styled to look enabled',
+        isNull,
+        reason: 'must be genuinely disabled (onPressed == null), not just '
+            'visually styled to look disabled',
       );
 
       final tooltip = tester.widget<Tooltip>(
-        find.byKey(const Key('attachEnabledTooltip')),
+        find.byKey(const Key('attachDisabledTooltip')),
       );
       expect(
         tooltip.message,
-        kAttachEnabledInfo,
-        reason: 'the capability/safety-boundary tooltip text must match '
-            'exactly — a future edit that waters down or drops the '
-            'automatic driver-exclusion or validated-duration disclosure '
-            'must fail here, not pass silently',
+        kAttachDisabledReason,
+        reason: 'the disabled-reason tooltip text must match exactly — a '
+            'future edit that waters down or vagues-up the specific '
+            'crash-defect explanation must fail here, not pass silently',
       );
     });
 
