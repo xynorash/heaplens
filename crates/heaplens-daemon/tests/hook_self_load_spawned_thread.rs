@@ -97,6 +97,106 @@ struct Summary {
     total_events_seen: u64,
 }
 
+/// For each `(ptr, size)` in `expected`, checks the *last* `kind == 0`
+/// (alloc) event captured for that ptr against `expected`'s size — not the
+/// first.
+///
+/// Comparing the first occurrence (this function's predecessor) is unsound:
+/// the harness's own `println!` calls after every real `alloc_n`/`free_n`
+/// make real `HeapAlloc`/`HeapFree` calls of their own (stdout's internal
+/// buffering), which the same active hook faithfully captures too. The
+/// allocator can legitimately reuse an address for one of these incidental,
+/// short-lived allocations *before* handing that same address out for the
+/// harness's own real scripted allocation later in the run — confirmed via
+/// direct event-log instrumentation during the 2026-07-26 flake
+/// investigation: address `0x27ff25f61f0` was genuinely alloc'd (size 30)
+/// and freed by stdout's own buffering, then alloc'd for real (size 32) by
+/// the harness, strictly in that order, both captured correctly. Matching
+/// the first occurrence for that ptr picks up the unrelated incidental
+/// allocation instead of the real one and reports a false size mismatch.
+/// The *last* alloc event for a ptr is always the one still live when its
+/// matching free (tracked separately, by `expected_frees`) occurs, so it's
+/// the one that actually corresponds to what the harness scripted.
+fn find_alloc_size_mismatches(
+    events: &[heaplens_protocol::AllocEvent],
+    expected: &std::collections::HashMap<u64, u64>,
+) -> Vec<(u64, u64, u64)> {
+    let mut last_alloc_size: std::collections::HashMap<u64, u64> = std::collections::HashMap::new();
+    for ev in events {
+        if ev.kind == 0 && expected.contains_key(&ev.ptr) {
+            last_alloc_size.insert(ev.ptr, ev.size);
+        }
+    }
+    let mut mismatches: Vec<(u64, u64, u64)> = expected
+        .iter()
+        .filter_map(|(&ptr, &expected_size)| {
+            let actual = *last_alloc_size.get(&ptr)?;
+            (actual != expected_size).then_some((ptr, expected_size, actual))
+        })
+        .collect();
+    mismatches.sort();
+    mismatches
+}
+
+#[cfg(test)]
+mod find_alloc_size_mismatches_tests {
+    use super::find_alloc_size_mismatches;
+    use heaplens_protocol::{AllocEvent, EventKind};
+    use std::collections::HashMap;
+
+    fn alloc_ev(ptr: u64, size: u64, ts: u64) -> AllocEvent {
+        AllocEvent::new(EventKind::Alloc, ptr, 0, size, 8, ts, [0u64; 16], 0)
+    }
+
+    fn free_ev(ptr: u64, ts: u64) -> AllocEvent {
+        AllocEvent::new(EventKind::Dealloc, ptr, 0, 0, 0, ts, [0u64; 16], 0)
+    }
+
+    #[test]
+    fn a_single_alloc_matching_expected_size_has_no_mismatch() {
+        let events = vec![alloc_ev(0x100, 32, 1)];
+        let expected = HashMap::from([(0x100, 32)]);
+        assert_eq!(find_alloc_size_mismatches(&events, &expected), vec![]);
+    }
+
+    #[test]
+    fn a_single_alloc_with_wrong_size_is_a_real_mismatch() {
+        let events = vec![alloc_ev(0x100, 40, 1)];
+        let expected = HashMap::from([(0x100, 32)]);
+        assert_eq!(find_alloc_size_mismatches(&events, &expected), vec![(0x100, 32, 40)]);
+    }
+
+    /// The exact confirmed scenario: an incidental alloc+free (stdout
+    /// buffering, size 30) reuses an address before the harness's own real
+    /// scripted alloc (size 32) claims it. Must not report a mismatch —
+    /// the *last* alloc event (32) is the one that matters.
+    #[test]
+    fn address_reused_by_an_incidental_alloc_before_the_real_one_is_not_a_mismatch() {
+        let events = vec![
+            alloc_ev(0x27ff25f61f0, 30, 100), // incidental (stdout buffering)
+            free_ev(0x27ff25f61f0, 200),      // incidental freed
+            alloc_ev(0x27ff25f61f0, 32, 300), // the harness's real alloc
+            free_ev(0x27ff25f61f0, 400),      // the harness's real free
+        ];
+        let expected = HashMap::from([(0x27ff25f61f0, 32)]);
+        assert_eq!(find_alloc_size_mismatches(&events, &expected), vec![]);
+    }
+
+    #[test]
+    fn a_pointer_never_alloced_is_absent_not_a_mismatch() {
+        let events: Vec<AllocEvent> = vec![];
+        let expected = HashMap::from([(0x100, 32)]);
+        assert_eq!(find_alloc_size_mismatches(&events, &expected), vec![]);
+    }
+
+    #[test]
+    fn events_for_untracked_pointers_are_ignored() {
+        let events = vec![alloc_ev(0x999, 999, 1), alloc_ev(0x100, 32, 2)];
+        let expected = HashMap::from([(0x100, 32)]);
+        assert_eq!(find_alloc_size_mismatches(&events, &expected), vec![]);
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn hook_self_load_spawned_thread_end_to_end() {
     let harness = harness_path();
@@ -223,11 +323,8 @@ async fn hook_self_load_spawned_thread_end_to_end() {
         match ev.kind {
             0 => {
                 graph.on_alloc(ev, &resolver);
-                if let Some(&expected_size) = expected.allocs.get(&ev.ptr) {
+                if expected.allocs.contains_key(&ev.ptr) {
                     s.matched_allocs.insert(ev.ptr);
-                    if ev.size != expected_size {
-                        s.alloc_size_mismatches.push((ev.ptr, expected_size, ev.size));
-                    }
                 }
             }
             1 => {
@@ -239,6 +336,7 @@ async fn hook_self_load_spawned_thread_end_to_end() {
             _ => {}
         }
     }
+    s.alloc_size_mismatches = find_alloc_size_mismatches(&events, &expected.allocs);
 
     *summary_for_graph.lock().unwrap() = s;
     let s = summary.lock().unwrap();
