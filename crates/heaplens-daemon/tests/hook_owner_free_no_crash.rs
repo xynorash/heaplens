@@ -75,29 +75,62 @@
 //!   for detach) appears to be gone or invalid, breaking the normal detach
 //!   path too.
 //!
-//! Unconfirmed (no debugger available in this pass) but mechanically
-//! plausible hypothesis: a worker thread suspended by the OS mid-critical-
-//! section — e.g. holding `heaplens_alloc`'s `DBGHELP_LOCK`
-//! (`capture_stack`'s `backtrace::trace_unsynchronized` serialization) or
-//! `ring.rs`'s registry `Mutex` — exactly as process teardown begins,
-//! deadlocking against whatever the exit sequence itself needs. This would
-//! explain why `fls_race_repro.exe`'s threads (one allocation each, mostly
-//! idle) never hit it in 6,000 attempts, while continuously-looping worker
-//! threads (spending a much larger fraction of their lifetime inside the
-//! hook's critical sections) hit it well over a third of the time.
+//! ## Root-caused and fixed, 2026-07-26 (same day, follow-up pass)
 //!
-//! Conclusion: the *original* crash (`0xC0000005`) is fixed — resolved,
-//! almost certainly as a side effect of the TLS/FLS work, per the timeline
-//! and root-cause match above. But this investigation found a *different*,
-//! more severe defect on the same "exit without detach" path: a hang that
-//! resists normal process termination. **The "Attach to Process" UI gate
-//! must stay disabled** — re-enabling it would trade a clean, honest crash
-//! for a silent, hard-to-kill zombie process, which is worse, not better.
-//! `multithreaded_exit_without_detach_is_clean` below is `#[ignore]`d
-//! (asserting it unconditionally would non-deterministically hang the test
-//! suite and leak unkillable processes on every run) — it exists to be run
-//! deliberately once this is properly root-caused with real debugging
-//! tools (this pass had none available) and fixed.
+//! Confirmed via WinDbg Preview (`cdbX64.exe -pv`, non-invasive attach —
+//! invasive attach was itself found to disturb the hang, reliably making
+//! it exit right as `DebugActiveProcess`-based attach completed, 3/3
+//! times; non-invasive attach doesn't). Symbol-resolved stack trace of
+//! the sole surviving ("main") thread, reproduced identically on two
+//! separate hung instances:
+//!
+//! ```text
+//! ntdll!NtWaitForAlertByThreadId
+//! ntdll!RtlWaitOnAddress
+//! KERNELBASE!WaitOnAddress
+//! heaplens_hook!std::sys::sync::mutex::futex::Mutex::lock_contended
+//! heaplens_hook!heaplens_alloc::capture::capture_stack   <- blocked here
+//! heaplens_hook!heaplens_alloc::record
+//! heaplens_hook!heaplens_hook::hook_heap_free
+//! ucrtbase!free_base
+//! ucrtbase!destroy_fls
+//! ntdll!RtlpFlsDataCleanup
+//! ntdll!LdrShutdownProcess
+//! ntdll!RtlExitUserProcess
+//! KERNEL32!ExitProcessImplementation
+//! ucrtbase!common_exit
+//! <target's own main>
+//! ```
+//!
+//! Confirmed mechanism: `RtlExitUserProcess` abruptly terminates the other
+//! worker threads without running their cleanup. If one was caught inside
+//! `capture_stack`, holding `heaplens_alloc::DBGHELP_LOCK` (a process-wide
+//! `Mutex<()>`, acquired on every hooked allocation from every thread —
+//! see `capture.rs`), that lock is now orphaned permanently. The sole
+//! surviving thread's own FLS cleanup then frees a fiber-local buffer;
+//! since hooks were never disabled (no explicit detach), that free routes
+//! through `hook_heap_free` -> `record` -> `capture_stack`, which tries to
+//! acquire the same orphaned lock and blocks forever. This explains the
+//! rate difference from `fls_race_repro.exe` precisely: threads spending a
+//! larger fraction of their lifetime inside `capture_stack` (continuous
+//! looping) have proportionally higher odds of being caught mid-lock at
+//! the instant of abrupt termination than short-lived, mostly-idle ones.
+//!
+//! Fixed in `heaplens-alloc/src/capture.rs`: `capture_stack` now uses
+//! `DBGHELP_LOCK.try_lock()` instead of `.lock()` — a held lock (orphaned
+//! or merely contended, indistinguishable and both handled identically)
+//! yields an empty, unresolved capture instead of blocking. Cannot
+//! deadlock regardless of *why* the lock is unavailable. Re-validated: 25
+//! manual runs (mixed batch/individual, exit codes explicitly checked)
+//! all clean post-fix, on the same machine and binaries that showed 9/10
+//! and 7/8 hung pre-fix.
+//!
+//! Conclusion: both defects on this path are now fixed and covered by
+//! permanent regression tests below (none `#[ignore]`d).
+//! `multithreaded_exit_without_detach_is_clean` is a real, asserting test
+//! now that the fix makes it reliably pass — re-enabling the "Attach to
+//! Process" UI gate is a separate, deliberate follow-up, not automatic
+//! just because this is fixed.
 //!
 //! This was, and remains, a **live** exposure, not just a test-harness
 //! concern: the daemon's own `TargetDisconnected` handling (`main.rs`) does
@@ -275,17 +308,27 @@ fn target_exit_without_detach_is_clean() {
 /// that called `LoadLibraryW`, which a single-threaded target's `main`
 /// alone can't exercise.
 ///
-/// `#[ignore]`d: this scenario does NOT crash, but reproduces a hang
-/// roughly 40-60% of the time (see this file's module doc comment for the
-/// full evidence — CPU-plateau observation, three termination mechanisms
-/// tried, injector's own `--detach` failing against a hung instance).
-/// Asserting this unconditionally would non-deterministically hang the
-/// test suite itself and leak processes that resist normal termination on
-/// every run. Run explicitly (`cargo test -- --ignored`) once this is
-/// root-caused with real debugging tools and fixed — at that point this
-/// should both pass reliably AND lose its `#[ignore]`.
+/// Used to be `#[ignore]`d: this scenario didn't crash, but reproduced a
+/// hang roughly 40-87.5% of the time across separate investigation
+/// sessions (CPU-plateau observation, resistance to normal process
+/// termination, injector's own `--detach` failing against a hung
+/// instance). Root-caused via WinDbg (`cdb -pv`, symbol-resolved stack
+/// trace, 2026-07-26): the sole surviving thread deadlocked in
+/// `heaplens_alloc::capture::capture_stack`'s `DBGHELP_LOCK.lock()` —
+/// `RtlExitUserProcess` abruptly terminates the other worker threads
+/// without cleanup, and if one was caught holding that lock at that
+/// instant, it's orphaned forever; the survivor's own FLS-cleanup-
+/// triggered heap free (still routed through the active hook, since no
+/// detach ran) then blocks on the same lock permanently. Fixed by
+/// replacing `capture_stack`'s blocking `.lock()` with `.try_lock()` (see
+/// `capture.rs`'s doc comment) — a held lock now yields an empty,
+/// unresolved capture instead of blocking, which cannot deadlock
+/// regardless of *why* the lock is held. Re-validated: 25 manual runs
+/// (10 + 10 + 5, mixed batch and individually-tracked exit codes) all
+/// clean post-fix, vs. 9/10 and 7/8 hung on the same machine, same
+/// binaries, pre-fix. No longer `#[ignore]`d — this is now an assertion
+/// of desired, confirmed-working behavior.
 #[test]
-#[ignore = "known hang (not crash), ~40-60% reproducing, resists normal process termination — see module doc comment"]
 fn multithreaded_exit_without_detach_is_clean() {
     let work_dir = std::env::temp_dir().join(format!("heaplens_mt_exit_nocrash_{}", std::process::id()));
     std::fs::create_dir_all(&work_dir).unwrap();
