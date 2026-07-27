@@ -30,22 +30,24 @@ static GLOBAL: HeapLensAlloc = HeapLensAlloc::new();
 
 use std::time::{Duration, Instant};
 
+// Shared with checkout_service_gui.rs (the iced GUI demo target) — see
+// that file's module comment and support/checkout_common.rs's own doc
+// comment for why these specific functions are the reusable part and the
+// owner allocations (pool manager, queue owner, both still directly below
+// in `main`) are not.
+#[path = "support/checkout_common.rs"]
+mod checkout_common;
+use checkout_common::{
+    metrics_flush_write_entry, order_queue_accept_orders,
+    payment_gateway_pool_checkout_connections, request_handler_handle,
+};
+
 const PHASE_MS: u64 = 15_000;
 
 /// Keeps event timestamps advancing during a hold — `heaplens-daemon`'s
 /// anomaly age (`max_ts_seen`) only advances via new captured events, never
 /// wall-clock, so every phase needs a steady trickle of real allocation
-/// traffic even while "waiting." Doubles as `request_handler`'s own
-/// healthy-phase workload — matched alloc/dealloc pairs, nothing ever
-/// accumulates.
-#[inline(never)]
-fn request_handler_handle(n: usize) {
-    let response = vec![0u8; 96]; // stand-in for a serialized Response body
-    std::hint::black_box(&response);
-    drop(response);
-    let _ = n;
-}
-
+/// traffic even while "waiting."
 fn request_handler_serve_for(duration_ms: u64) {
     let start = Instant::now();
     let mut count = 0usize;
@@ -56,45 +58,11 @@ fn request_handler_serve_for(duration_ms: u64) {
     }
 }
 
-/// Each checked-out connection — a real one would hold a socket, auth
-/// token, and buffers; `128` bytes stands in for that struct.
-///
-/// The pool manager (`payment_gateway_pool_initialize`, below) is allocated
-/// directly in `main`, deliberately not inside its own helper function:
-/// phi links a child to an owner by matching the owner's effective call
-/// site against the *ancestor frames* of the child's own captured stack.
-/// A helper function that allocates the manager and returns would never
-/// appear in a later, separately-called connection's stack at all — phi
-/// would find no owner to link to, not "no longer owned" (which is what a
-/// leak needs to demonstrate to be visible). Allocating the manager
-/// directly in `main`, and connections through this distinct helper
-/// (called from `main` too), means each connection's stack is
-/// `[.., payment_gateway_pool_checkout_connections, main, ..]` — `main` is
-/// an ancestor, and `main` is exactly the manager's own effective site.
-/// This is the same shape `chaos_orphan.rs`'s `owner`/`make_children`
-/// split uses, and `order_queue_accept_orders` below mirrors it too.
-#[inline(never)]
-fn payment_gateway_pool_checkout_connections(n: usize) -> Vec<Vec<u8>> {
-    (0..n).map(|_| vec![0u8; 128]).collect()
-}
-
-/// A real order — a real one would hold line items, a customer id,
-/// shipping address; `96` bytes stands in for that struct.
-#[inline(never)]
-fn order_queue_accept_orders(n: usize) -> Vec<Vec<u8>> {
-    (0..n).map(|_| vec![0u8; 96]).collect()
-}
-
-/// A single metrics log entry — small, high-frequency, exactly the shape
-/// that turns into a storm when something upstream (a retry loop, a bug in
-/// a batching layer) stops throttling how often it fires.
-#[inline(never)]
-fn metrics_flush_write_entry(n: usize) {
-    let entry = vec![0u8; 24];
-    std::hint::black_box(&entry);
-    drop(entry);
-    let _ = n;
-}
+// payment_gateway_pool_checkout_connections / order_queue_accept_orders /
+// metrics_flush_write_entry now live in checkout_common.rs — see that
+// file's doc comment for the phi-ancestry reasoning behind why the pool
+// manager / queue owner allocations below stay directly in `main` rather
+// than moving there too.
 
 fn main() {
     println!("[checkout_service] starting — request_handler online, payment_gateway_pool warm, order_queue idle");

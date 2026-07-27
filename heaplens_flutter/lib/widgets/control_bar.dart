@@ -398,31 +398,26 @@ class _ConnectionIndicator extends StatelessWidget {
   }
 }
 
-/// Cross-process attachment (2026-07-26): disabled again after a second,
-/// distinct confirmed hook defect — separate from the concurrent-allocation
-/// crash fixed and validated on 2026-07-22 (that fix remains correct and in
-/// place; this is not a regression of it). A target process that exits
-/// normally while HeapLens's hooks are still installed (no explicit Detach
-/// first) crashes reliably (STATUS_ACCESS_VIOLATION), 100% reproducing.
-/// Root cause: heaplens-hook has no DLL_PROCESS_DETACH safety handling — the
-/// module is torn down by the OS while its MinHook trampolines, reentrancy
-/// guard, ring buffer, and private-heap state are all still live and hooks
-/// still intercept calls. See README.txt for the full evidence trail.
-/// `kAttachEnabled` stays a single flippable gate (not deleted) so this
-/// regression is disabled the same visible, honest way the prior one was —
-/// present but disabled with a reason, never silently removed.
-const bool kAttachEnabled = false;
+/// Cross-process attachment (2026-07-28): re-enabled. Both confirmed hook
+/// defects behind the two prior disable periods are fixed and validated on
+/// this branch: the concurrent-allocation crash (fixed 2026-07-22) and the
+/// exit-without-detach DLL_PROCESS_DETACH crash (root-caused and fixed via
+/// raw TlsAlloc/FlsAlloc in place of thread_local!, see heaplens-alloc's
+/// guard.rs/ring.rs doc comments). `kAttachEnabled` stays a single
+/// flippable gate (not deleted) so any future regression can be disabled
+/// the same visible, honest way — present but disabled with a reason,
+/// never silently removed.
+const bool kAttachEnabled = true;
 const String kAttachDisabledReason =
     'Process attachment is temporarily disabled — a confirmed crash occurs '
     'if the attached process exits normally without an explicit Detach '
     'first. Fix in progress. Cooperative capture (used by all bundled '
     'example producers) is unaffected.';
 const String kAttachEnabledInfo =
-    'Process attachment is enabled. HeapLens automatically refuses '
+    'Process attachment is enabled and validated against controlled, '
+    'standard, non-kernel-driver software. HeapLens automatically refuses '
     'processes with kernel-mode driver components (VPN/anti-cheat/security '
-    'software) for safety. Validated against real-world software (native, '
-    'Electron, Node/V8) for sessions up to 2+ hours; longer-duration or '
-    'highly specialized targets are less tested.';
+    'software) for safety.';
 
 /// "Attach to Process…" button when nothing is attached, or a compact
 /// "attached" indicator plus a Detach button when one is. The full
