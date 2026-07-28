@@ -97,9 +97,28 @@ pub fn leak_pool_tick(
 /// that: the +30 batch's ancestor chain would then go through the *other*
 /// function's frame, which is not the queue owner's own effective site,
 /// and phi would never link it back.
+///
+/// `backlog.reserve(40)` happens *before* `queue_owner` is allocated, not
+/// after — matching `hot_producer.rs`'s own documented safe ordering
+/// ("children's own backing storage must be allocated before owner, not
+/// after"). `backlog` starts empty (`Vec::new()`), so without this
+/// upfront reserve, its first `.extend()` call would grow its own backing
+/// array *from inside this same function* — the same effective site as
+/// `queue_owner` — making it a more-recently-allocated same-site
+/// candidate than `queue_owner` by the time the second (`add_extra`)
+/// batch arrives. Phi's recency tie-break would then attribute that
+/// batch to backlog's own backing array instead of `queue_owner`,
+/// splitting the 40 total children roughly 10/30 across two different
+/// nodes, neither of which crosses `hot_cluster_threshold` (32) alone —
+/// confirmed as the actual cause of `queue_owner` never flipping Hot in
+/// the graph despite the console correctly logging "40 orders and still
+/// growing." Reserving the full capacity upfront means every later
+/// `.extend()` fits in already-allocated space, so no such reallocation
+/// — and no such competing candidate — ever occurs.
 #[inline(never)]
 pub fn hot_cluster_tick(queue_owner: &mut Option<Vec<u8>>, backlog: &mut Vec<Vec<u8>>, add_extra: bool) {
     if queue_owner.is_none() {
+        backlog.reserve(40);
         *queue_owner = Some(vec![0u8; 512]);
         backlog.extend(order_queue_accept_orders(10));
     }
