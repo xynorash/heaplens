@@ -17,10 +17,7 @@ static GLOBAL: HeapLensAlloc = HeapLensAlloc::new();
 
 #[path = "support/checkout_common.rs"]
 mod checkout_common;
-use checkout_common::{
-    metrics_flush_write_entry, order_queue_accept_orders,
-    payment_gateway_pool_checkout_connections, request_handler_handle,
-};
+use checkout_common::{hot_cluster_heal, hot_cluster_tick, leak_pool_tick, request_handler_handle};
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
 use crossterm::execute;
@@ -136,6 +133,13 @@ struct State {
     queue_owner: Option<Vec<u8>>,
     backlog: Vec<Vec<u8>>,
     hot_extra_added: bool,
+    // Recovered order_queue owners/backlog remnants, kept alive after each
+    // heal — matches checkout_service.rs's console fix: "back to healthy"
+    // means the family is still there, small and no longer growing, not
+    // that it vanished outright. See HotDrain handling in
+    // fire_due_script_events.
+    healthy_queue_owners: Vec<Vec<u8>>,
+    healthy_backlog_remnants: Vec<Vec<u8>>,
 
     storm_active: bool,
     storm_bursts_this_run: usize,
@@ -165,6 +169,8 @@ impl State {
             queue_owner: None,
             backlog: Vec::new(),
             hot_extra_added: false,
+            healthy_queue_owners: Vec::new(),
+            healthy_backlog_remnants: Vec::new(),
             storm_active: false,
             storm_bursts_this_run: 0,
             phase: Phase::Nominal,
@@ -190,21 +196,19 @@ impl State {
         }
     }
 
-    // ── Owner-allocation funnels ────────────────────────────────────────
-    // Both call sites for a given owner's children route through the SAME
-    // named function so phi's ancestor-frame matching sees a consistent
-    // effective site for the owner — identical pattern to
-    // checkout_service_gui.rs, unchanged by the rendering-layer pivot.
+    // ── Event triggers ───────────────────────────────────────────────────
+    // These delegate to checkout_common's shared functions — the exact
+    // same functions checkout_service.rs (console) calls — so both targets
+    // produce identical phi-owner call sites and identical recovery
+    // behavior. See checkout_common.rs's module doc comment.
 
-    #[inline(never)]
     fn leak_phase_tick(&mut self, release: bool) {
+        leak_pool_tick(&mut self.pool_manager, &mut self.leaked_connections_pending, release);
         if !release {
-            self.pool_manager = Some(vec![0u8; 256]);
-            let connections = payment_gateway_pool_checkout_connections(12);
-            self.this_tick_alloc_events += 1 + connections.len() as u64;
-            self.leaked_connections_pending = Some(connections);
+            if let Some(conns) = &self.leaked_connections_pending {
+                self.this_tick_alloc_events += 1 + conns.len() as u64;
+            }
         } else if let Some(conns) = self.leaked_connections_pending.take() {
-            self.pool_manager = None;
             let n = conns.len();
             self.leaked_connections.extend(conns);
             self.log(format!(
@@ -213,33 +217,25 @@ impl State {
         }
     }
 
-    #[inline(never)]
     fn hot_phase_tick(&mut self, add_extra: bool) {
-        if self.queue_owner.is_none() {
-            self.queue_owner = Some(vec![0u8; 512]);
-            let initial = order_queue_accept_orders(10);
-            self.this_tick_alloc_events += 1 + initial.len() as u64;
-            self.backlog.extend(initial);
-        }
-        if add_extra && !self.hot_extra_added {
-            let extra = order_queue_accept_orders(30);
-            self.this_tick_alloc_events += extra.len() as u64;
-            self.backlog.extend(extra);
+        let owner_was_none = self.queue_owner.is_none();
+        let before_len = self.backlog.len();
+        let should_add_extra = add_extra && !self.hot_extra_added;
+        hot_cluster_tick(&mut self.queue_owner, &mut self.backlog, should_add_extra);
+        let added = self.backlog.len() - before_len;
+        self.this_tick_alloc_events += added as u64 + if owner_was_none { 1 } else { 0 };
+        if should_add_extra {
             self.hot_extra_added = true;
             self.log(format!("order_queue: backlog at {} orders and still growing", self.backlog.len()));
         }
     }
 
-    #[inline(never)]
     fn storm_burst(&mut self, n: usize) {
-        for i in 0..n {
-            metrics_flush_write_entry(i);
-        }
+        checkout_common::storm_burst(n);
         self.this_tick_alloc_events += n as u64;
         self.storm_bursts_this_run += 1;
     }
 
-    #[inline(never)]
     fn ambient_tick(&mut self, n: usize) {
         for i in 0..n {
             request_handler_handle(i);
@@ -306,10 +302,16 @@ impl State {
                 }
                 ScriptEvent::HotGrow => self.hot_phase_tick(true),
                 ScriptEvent::HotDrain => {
-                    self.backlog.clear();
-                    self.queue_owner = None;
+                    let remnant_total = hot_cluster_heal(
+                        &mut self.queue_owner,
+                        &mut self.backlog,
+                        &mut self.healthy_queue_owners,
+                        &mut self.healthy_backlog_remnants,
+                    );
                     self.hot_extra_added = false;
-                    self.log("order_queue: backlog drained, back to a healthy depth");
+                    self.log(format!(
+                        "order_queue: backlog drained, back to a healthy depth ({remnant_total} orders kept alive across all cycles)"
+                    ));
                     self.phase = Phase::Nominal;
                 }
                 ScriptEvent::StormStart => {
@@ -375,7 +377,7 @@ impl State {
                 self.ambient_tick(40);
             }
             if jitter == 5 {
-                let mini = order_queue_accept_orders(6);
+                let mini = checkout_common::order_queue_accept_orders(6);
                 drop(mini);
             }
         }

@@ -30,19 +30,17 @@ static GLOBAL: HeapLensAlloc = HeapLensAlloc::new();
 
 use std::time::{Duration, Instant};
 
-// Shared with checkout_service_gui.rs (the iced GUI demo target) — see
-// that file's module comment and support/checkout_common.rs's own doc
-// comment for why these specific functions are the reusable part and the
-// owner allocations (pool manager, queue owner, both still directly below
-// in `main`) are not.
+// Shared with checkout_service_tui.rs (and checkout_service_gui.rs, parked)
+// — see checkout_common.rs's own module doc comment for why the event
+// functions below are safe to share verbatim across every target
+// regardless of each target's own control flow.
 #[path = "support/checkout_common.rs"]
 mod checkout_common;
 use checkout_common::{
-    metrics_flush_write_entry, order_queue_accept_orders,
-    payment_gateway_pool_checkout_connections, request_handler_handle,
+    hot_cluster_heal, hot_cluster_tick, leak_pool_tick, request_handler_handle, storm_burst,
 };
 
-const PHASE_MS: u64 = 15_000;
+const PHASE_MS: u64 = 30_000;
 
 /// Keeps event timestamps advancing during a hold — `heaplens-daemon`'s
 /// anomaly age (`max_ts_seen`) only advances via new captured events, never
@@ -58,12 +56,6 @@ fn request_handler_serve_for(duration_ms: u64) {
     }
 }
 
-// payment_gateway_pool_checkout_connections / order_queue_accept_orders /
-// metrics_flush_write_entry now live in checkout_common.rs — see that
-// file's doc comment for the phi-ancestry reasoning behind why the pool
-// manager / queue owner allocations below stay directly in `main` rather
-// than moving there too.
-
 fn main() {
     println!("[checkout_service] starting — request_handler online, payment_gateway_pool warm, order_queue idle");
     let _ = std::io::Write::flush(&mut std::io::stdout());
@@ -71,6 +63,16 @@ fn main() {
     // Connections leaked by payment_gateway_pool persist across every
     // cycle, deliberately never freed — see the module doc comment.
     let mut leaked_connections: Vec<Vec<u8>> = Vec::new();
+
+    // Recovered order_queue owners/backlog remnants, kept alive (never
+    // dropped) after each hot-cluster phase heals. Unlike the leak above,
+    // this is not a bug — it's what lets the recovery be *visible* as a
+    // "back to healthy" family in the graph rather than the owner and its
+    // children vanishing outright the instant the phase ends, which reads
+    // identically to "nothing was ever here" rather than "this grew, then
+    // came back under control."
+    let mut healthy_queue_owners: Vec<Vec<u8>> = Vec::new();
+    let mut healthy_backlog_remnants: Vec<Vec<u8>> = Vec::new();
 
     loop {
         // ── T+0s: healthy ──────────────────────────────────────────────
@@ -81,10 +83,12 @@ fn main() {
         // ── T+15s: LEAK — pool manager dropped while connections live ──
         println!("=== EVENT: FLAW — payment_gateway_pool manager torn down while 12 connections still checked out (leak) ===");
         let _ = std::io::Write::flush(&mut std::io::stdout());
-        let pool_manager = vec![0u8; 256]; // PoolManager { connections: Vec<Connection>, retry_policy, tls_config, .. }
-        let mut connections = payment_gateway_pool_checkout_connections(12);
+        let mut pool_manager: Option<Vec<u8>> = None;
+        let mut pending_connections: Option<Vec<Vec<u8>>> = None;
+        leak_pool_tick(&mut pool_manager, &mut pending_connections, false);
         request_handler_serve_for(2_000); // manager and connections visibly live together first
-        drop(pool_manager); // the bug: manager torn down, connections never released
+        leak_pool_tick(&mut pool_manager, &mut pending_connections, true); // the bug
+        let mut connections = pending_connections.take().unwrap_or_default();
         println!("    payment_gateway_pool: manager freed — {} connections now orphaned and will never be released", connections.len());
         let _ = std::io::Write::flush(&mut std::io::stdout());
         leaked_connections.append(&mut connections);
@@ -93,17 +97,24 @@ fn main() {
         // ── T+30s: HOT CLUSTER — order backlog grows unbounded ─────────
         println!("=== EVENT: FLAW — order_queue backlog growing past healthy size (hot cluster) ===");
         let _ = std::io::Write::flush(&mut std::io::stdout());
-        let queue_owner = vec![0u8; 512]; // stand-in for OrderQueue { backlog: Vec<Order>, .. }
-        let mut backlog = order_queue_accept_orders(10); // still under the healthy threshold
+        let mut queue_owner: Option<Vec<u8>> = None;
+        let mut backlog: Vec<Vec<u8>> = Vec::new();
+        hot_cluster_tick(&mut queue_owner, &mut backlog, false); // still under the healthy threshold
         request_handler_serve_for(3_000);
-        backlog.extend(order_queue_accept_orders(30)); // now well past it
+        hot_cluster_tick(&mut queue_owner, &mut backlog, true); // now well past it
         println!("    order_queue: backlog at {} orders and still growing", backlog.len());
         let _ = std::io::Write::flush(&mut std::io::stdout());
         request_handler_serve_for(PHASE_MS - 3_000);
-        // Recovered: the backlog gets processed and drained, unlike the leak above.
-        drop(backlog);
-        drop(queue_owner);
-        println!("    order_queue: backlog drained, back to a healthy depth");
+        // Recovered: processed down to a healthy depth, unlike the leak
+        // above — but "recovered" means the family is still there, just
+        // small and no longer growing, not that it vanished.
+        let remnant_total = hot_cluster_heal(
+            &mut queue_owner,
+            &mut backlog,
+            &mut healthy_queue_owners,
+            &mut healthy_backlog_remnants,
+        );
+        println!("    order_queue: backlog drained, back to a healthy depth ({remnant_total} orders kept alive across all cycles)");
         let _ = std::io::Write::flush(&mut std::io::stdout());
 
         // ── T+45s: ALLOC STORM — metrics flush loses its throttle ──────
@@ -116,9 +127,7 @@ fn main() {
             // next burst — keeps the storm visibly "ongoing" for the whole
             // phase rather than a single instantaneous spike that's easy to
             // miss.
-            for i in 0..2_000 {
-                metrics_flush_write_entry(i);
-            }
+            storm_burst(2_000);
             burst += 1;
             std::thread::sleep(Duration::from_millis(1_500));
         }

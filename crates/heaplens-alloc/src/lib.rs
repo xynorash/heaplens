@@ -13,6 +13,41 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use heaplens_protocol::EventKind;
 use heaplens_protocol::AllocEvent;
 
+/// Cooperative auto-connect must never be silent. A `HeapLensAlloc`-linked
+/// binary launched with `HEAPLENS_ENABLE` unset does nothing — no pipe
+/// connection is ever attempted — regardless of how many allocations it
+/// makes. This is the enforcement point for "HeapLens must never be
+/// automatically attached to anything": launching such a binary is not, by
+/// itself, an explicit request to be observed. Set `HEAPLENS_ENABLE=1`
+/// (any value) to opt a specific run in.
+///
+/// This does not gate `heaplens-hook`'s injection path — attaching via the
+/// injector (CLI or the Flutter UI's picker) is already the explicit
+/// action; see `ensure_writer_started`'s doc comment for why that path's
+/// eager call makes this check a no-op for it.
+///
+/// Deliberately **not** `OnceLock`: confirmed empirically that
+/// `OnceLock::get_or_init`'s closure here (which allocates, via
+/// `std::env::var_os`) deadlocks the process on its very first-ever
+/// allocation, before even reaching `main()` — even called from behind the
+/// reentrancy guard, which normally makes an allocating closure safe here
+/// (see `ensure_writer`'s writer-thread-name allocation for the
+/// established, working version of that pattern with a plain `Once`).
+/// `OnceLock` specifically was the problem, not the ordering; a plain
+/// racy-but-idempotent atomic cache, matching this file's own
+/// `WRITER_DEAD`/`WRITER_SHOULD_STOP` idiom, has none of that hazard: a
+/// reentrant call during initialization just redundantly recomputes the
+/// same env lookup and stores the same value, rather than deadlocking.
+fn cooperative_capture_enabled() -> bool {
+    static INITIALIZED: AtomicBool = AtomicBool::new(false);
+    static ENABLED: AtomicBool = AtomicBool::new(false);
+    if !INITIALIZED.load(Ordering::Relaxed) {
+        ENABLED.store(std::env::var_os("HEAPLENS_ENABLE").is_some(), Ordering::Relaxed);
+        INITIALIZED.store(true, Ordering::Relaxed);
+    }
+    ENABLED.load(Ordering::Relaxed)
+}
+
 /// Serializes every call into `backtrace`'s Windows backend — both
 /// `capture::capture_stack`'s `trace_unsynchronized` (called from every
 /// allocating thread, on the hot path) and `writer::run`'s `resolve` calls
@@ -38,9 +73,14 @@ pub(crate) static DBGHELP_LOCK: Mutex<()> = Mutex::new(());
 /// static GLOBAL: HeapLensAlloc = HeapLensAlloc::new();
 /// ```
 ///
-/// Activate before the program's first allocation. The background writer thread
-/// is spawned lazily on first record; it permanently holds the recursion guard
-/// so none of its own allocations are ever recorded.
+/// **Linking this in does nothing by itself.** No pipe connection is ever
+/// attempted unless the process is run with `HEAPLENS_ENABLE` set (any
+/// value) — see `cooperative_capture_enabled`'s doc comment. This is
+/// deliberate: HeapLens must never be automatically attached to anything,
+/// and a binary that merely links `HeapLensAlloc` is not, by itself, a
+/// request to be observed. If enabled, the background writer thread is
+/// spawned lazily on first record; it permanently holds the recursion
+/// guard so none of its own allocations are ever recorded.
 pub struct HeapLensAlloc;
 
 impl HeapLensAlloc {
@@ -201,8 +241,10 @@ pub fn warm_up_symbol_resolution() {
 ///
 /// Invariants enforced here:
 /// 1. Guard checked first — re-entrant calls return immediately.
-/// 2. Guard set via RAII ScopedGuard — cleared even on panic.
-/// 3. No allocation, no locking.
+/// 2. Guard set via RAII ScopedGuard **before anything that might itself
+///    allocate** — including the `HEAPLENS_ENABLE` check, which does (see
+///    that check's own comment below) — cleared even on panic.
+/// 3. No allocation outside the guard, no locking.
 /// 4. ring::push failure (full ring) is a silent drop.
 ///
 /// Public so that other capture front-ends (e.g. `heaplens-hook`'s injected
@@ -215,11 +257,32 @@ pub fn record(kind: EventKind, ptr: u64, old_ptr: u64, size: u64, align: u32) {
     // 1. Re-entrancy check — must be the very first thing.
     if guard::is_set() { return; }
 
+    // 2. Acquire guard (panic-safe RAII) — before anything below that
+    // might itself allocate. `cooperative_capture_enabled()`'s
+    // `std::env::var_os` call is exactly such a case (confirmed: it
+    // allocates internally on Windows to build the OsString). Without the
+    // guard held first, that nested allocation re-enters `record()` before
+    // `guard::is_set()` would see it, which re-enters
+    // `cooperative_capture_enabled()`, which calls `OnceLock::get_or_init`
+    // recursively while the outer call is still running — documented by
+    // `OnceLock` to deadlock or panic. Confirmed empirically: with the
+    // check ordered before this guard acquisition, the very first
+    // allocation any cooperative process ever makes deadlocks it silently,
+    // before even its own first `println!`.
+    let _g = guard::ScopedGuard::enter();
+
+    // Never auto-attach: if capture was never explicitly started — neither
+    // via cooperative opt-in (HEAPLENS_ENABLE) nor via heaplens-hook's
+    // eager ensure_writer_started() call at attach time (which fires
+    // WRITER_ONCE before any hook is enabled, so is_completed() is true by
+    // the time an injected trampoline ever reaches this function) — bail
+    // out now, before any further capture work happens.
+    if !WRITER_ONCE.is_completed() && !cooperative_capture_enabled() {
+        return;
+    }
+
     // Early-exit if the writer thread failed to spawn; no consumer exists.
     if WRITER_DEAD.load(Ordering::Relaxed) { return; }
-
-    // 2. Acquire guard (panic-safe RAII).
-    let _g = guard::ScopedGuard::enter();
 
     // 3. Timestamp (no alloc).
     let ts = capture::timestamp_nanos();
