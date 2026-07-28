@@ -228,6 +228,24 @@ pub fn run() {
 /// plausible user-code collision.
 const MACHINERY_PREFIXES: &[&str] = &[
     "heaplens_alloc::",
+    // The injection trampoline crate — MinHook-detoured
+    // RtlAllocateHeap/RtlReAllocateHeap/RtlFreeHeap all route through
+    // heaplens_hook's own hook_heap_* functions before reaching
+    // heaplens_alloc::record. Missing this prefix collapses every
+    // injected allocation's effective site onto the single shared hook
+    // frame (it's the nearest non-machinery-looking frame above the
+    // capture pipeline for literally every hooked call), destroying all
+    // ownership structure under injection specifically — confirmed via a
+    // live injected run showing "Dominant consumer at
+    // heaplens_hook::hook_heap_alloc" and zero inferred edges, while the
+    // exact same target's cooperative-capture run resolved real business
+    // logic call sites correctly. This gap was previously masked because
+    // every cooperative-capable target also auto-connected cooperatively
+    // regardless of injection, so the (correct) cooperative stream always
+    // arrived first; it only became visible once cooperative auto-connect
+    // required explicit opt-in (HEAPLENS_ENABLE) and injection became the
+    // sole data source for an unopted-in target.
+    "heaplens_hook::",
     "backtrace::",
     "alloc::",
     "core::alloc::",
@@ -280,6 +298,27 @@ mod tests {
         assert!(is_machinery_symbol("alloc::raw_vec::RawVecInner::try_allocate_in"));
         assert!(is_machinery_symbol("core::alloc::global::GlobalAlloc::alloc_zeroed"));
         assert!(is_machinery_symbol("core::ptr::drop_in_place<alloc::vec::Vec<u8>>"));
+    }
+
+    #[test]
+    fn classifies_injection_trampoline_as_machinery() {
+        // Regression: confirmed via a live injected checkout_service.exe run
+        // that heaplens_hook's own MinHook trampolines were NOT in
+        // MACHINERY_PREFIXES — every hooked allocation's effective site
+        // collapsed onto "heaplens_hook::hook_heap_alloc" (the nearest
+        // non-machinery-looking frame above the capture pipeline for every
+        // single hooked call), producing zero real ownership edges under
+        // injection specifically, even though the exact same allocation
+        // sites resolved correctly via cooperative capture. See
+        // MACHINERY_PREFIXES's own doc comment for why this was previously
+        // masked rather than caught earlier.
+        assert!(is_machinery_symbol("heaplens_hook::hook_heap_alloc"));
+        assert!(is_machinery_symbol("heaplens_hook::hook_heap_realloc"));
+        assert!(is_machinery_symbol("heaplens_hook::hook_heap_free"));
+        // False-positive guard: a user crate literally named "heaplens_hook_app"
+        // must not collide — the check requires the trailing "::", not a bare
+        // "heaplens_hook" substring.
+        assert!(!is_machinery_symbol("heaplens_hook_app::main"));
     }
 
     #[test]
